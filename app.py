@@ -1,6 +1,6 @@
 """
 inst-scanner/app.py
-Flask backend for the Poppa Alpha Institutional tab.
+Flask backend for the Osprey Institutional tab.
 
 Endpoints:
   GET  /api/health                                   — health check
@@ -8,6 +8,7 @@ Endpoints:
   GET  /api/results?universe=portfolio&days=90       — cached filings
   POST /api/scan  {"universe":"portfolio","days":90} — trigger async re-scan
   GET  /api/poll?universe=portfolio&days=90          — poll scan progress
+  POST /api/backfill                                 — 90-day backfill all universes
 """
 
 import threading
@@ -20,8 +21,10 @@ from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+from apscheduler.schedulers.background import BackgroundScheduler
 
 from scanner import scan_tickers, UNIVERSES
+import db
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -67,8 +70,8 @@ SCANNING: set = set()
 _cache_lock = threading.Lock()
 
 DEFAULT_DAYS = 90
-SCAN_ORDER   = ["portfolio", "myportfolio", "smh", "soxx", "ndx100", "sp500"]
-SCAN_WINDOWS = [30, 90]          # days lookbacks to pre-cache
+BACKFILL_DAYS = 90          # lookback for scheduled + backfill runs
+SCAN_WINDOWS  = [90]        # days lookbacks to pre-cache
 
 
 # ── Scanner logic ─────────────────────────────────────────────────────────────
@@ -78,7 +81,7 @@ def _cache_key(universe: str, days: int) -> tuple:
 
 
 def _run_scan(universe_key: str, days: int):
-    """Fetch EDGAR filings for one universe/window and update cache."""
+    """Fetch EDGAR filings for one universe/window, update cache, persist to DB."""
     key = _cache_key(universe_key, days)
     if key in SCANNING:
         logger.info("Already scanning %s/%dd — skipping", universe_key, days)
@@ -96,14 +99,17 @@ def _run_scan(universe_key: str, days: int):
     try:
         results = scan_tickers(tickers, days=days, enrich=True)
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        entry = {
+            "results":    results,
+            "scanned_at": now,
+            "count":      len(results),
+            "universe":   universe_key,
+            "days":       days,
+        }
         with _cache_lock:
-            CACHE[key] = {
-                "results":    results,
-                "scanned_at": now,
-                "count":      len(results),
-                "universe":   universe_key,
-                "days":       days,
-            }
+            CACHE[key] = entry
+        # Persist to PostgreSQL so results survive redeploys
+        db.save_scan(universe_key, days, now, results)
         logger.info("Done: %s/%dd — %d filings", universe_key, days, len(results))
     except Exception as exc:
         logger.error("Scan error (%s/%dd): %s", universe_key, days, exc)
@@ -111,18 +117,26 @@ def _run_scan(universe_key: str, days: int):
         SCANNING.discard(key)
 
 
-def _background_scheduler():
+def _daily_fetch():
     """
-    On startup: scan key universes for each lookback window.
-    Repeat every 6 hours so filings stay current.
+    Daily scheduled fetch — runs at 7am EST (12:00 UTC).
+    Scans ALL universes with BACKFILL_DAYS lookback and saves to DB.
+    Picks up any new universes or tickers added to UNIVERSES automatically.
     """
-    while True:
-        for ukey in SCAN_ORDER:
-            for days in SCAN_WINDOWS:
-                _run_scan(ukey, days)
-                time.sleep(5)
-        logger.info("Institutional scan cycle complete. Sleeping 6 hours.")
-        time.sleep(6 * 3_600)
+    logger.info("=== Daily institutional fetch starting (%dd lookback) ===", BACKFILL_DAYS)
+    for ukey in UNIVERSES:
+        _run_scan(ukey, BACKFILL_DAYS)
+        time.sleep(5)   # be polite to SEC EDGAR
+    logger.info("=== Daily institutional fetch complete ===")
+
+
+def _run_backfill():
+    """One-time 90-day backfill across all universes — runs in background."""
+    logger.info("=== Institutional backfill starting (all universes, %dd) ===", BACKFILL_DAYS)
+    for ukey in UNIVERSES:
+        _run_scan(ukey, BACKFILL_DAYS)
+        time.sleep(5)
+    logger.info("=== Institutional backfill complete ===")
 
 
 # ── API routes ────────────────────────────────────────────────────────────────
@@ -230,18 +244,75 @@ def poll():
     return jsonify({"ready": False, "scanning": scanning})
 
 
+@app.route("/api/backfill", methods=["POST"])
+def trigger_backfill():
+    """
+    Trigger a 90-day backfill across all universes in background.
+    Use this once after deploy to populate the DB.
+    """
+    t = threading.Thread(target=_run_backfill, daemon=True)
+    t.start()
+    return jsonify({
+        "status":    "started",
+        "message":   f"90-day backfill running for all universes: {list(UNIVERSES.keys())}",
+        "universes": list(UNIVERSES.keys()),
+        "days":      BACKFILL_DAYS,
+    })
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _now():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+# ── Startup ───────────────────────────────────────────────────────────────────
+
+def _startup():
+    # 1. Initialise DB schema
+    db.init_db()
+
+    # 2. Load any previously saved results from PostgreSQL into memory
+    #    so results are available immediately after a redeploy
+    cached = db.load_all_cached()
+    if cached:
+        with _cache_lock:
+            CACHE.update(cached)
+        logger.info("Cache pre-loaded from DB (%d entries)", len(cached))
+    else:
+        # No DB data yet — kick off a full backfill in background
+        logger.info("No cached data in DB — triggering initial backfill")
+        t = threading.Thread(target=_run_backfill, daemon=True)
+        t.start()
+
+    # 3. Daily scheduler at 12:00 UTC = 7:00 AM EST
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(
+        _daily_fetch,
+        "cron",
+        hour=12, minute=0,
+        id="daily_inst_fetch",
+        replace_existing=True,
+    )
+    scheduler.start()
+    logger.info("Scheduler started — daily institutional fetch at 12:00 UTC (7:00 AM EST)")
+
+
+# Run startup logic once (gunicorn spawns multiple workers; only master needs this)
+# Using a simple flag to avoid double-init in dev mode with reloader
+_started = False
+
+@app.before_request
+def _lazy_startup():
+    global _started
+    if not _started:
+        _started = True
+        _startup()
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    bg = threading.Thread(target=_background_scheduler, daemon=True)
-    bg.start()
-
-    import os
+    _startup()
     port = int(os.environ.get("PORT", 5002))
     app.run(host="0.0.0.0", port=port)
