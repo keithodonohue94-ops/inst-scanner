@@ -77,6 +77,11 @@ DEFAULT_DAYS = 90
 BACKFILL_DAYS = 90          # lookback for scheduled + backfill runs
 SCAN_WINDOWS  = [90]        # days lookbacks to pre-cache
 
+# Universes excluded from scheduled daily scans and backfills — too many
+# tickers to scan via EDGAR (sp500 = 500 tickers, ndx100 = 100 tickers).
+# Users can still trigger manual Run Scan for these from the UI.
+SKIP_SCHEDULED = {"sp500", "ndx100"}
+
 
 # ── Scanner logic ─────────────────────────────────────────────────────────────
 
@@ -124,20 +129,24 @@ def _run_scan(universe_key: str, days: int):
 def _daily_fetch():
     """
     Daily scheduled fetch — runs at 7am EST (12:00 UTC).
-    Scans ALL universes with BACKFILL_DAYS lookback and saves to DB.
-    Picks up any new universes or tickers added to UNIVERSES automatically.
+    Scans all universes except those in SKIP_SCHEDULED (sp500, ndx100 —
+    too many tickers for a daily EDGAR scan).
     """
-    logger.info("=== Daily institutional fetch starting (%dd lookback) ===", BACKFILL_DAYS)
-    for ukey in UNIVERSES:
+    to_scan = [k for k in UNIVERSES if k not in SKIP_SCHEDULED]
+    logger.info("=== Daily institutional fetch starting (%dd, %d universes) ===",
+                BACKFILL_DAYS, len(to_scan))
+    for ukey in to_scan:
         _run_scan(ukey, BACKFILL_DAYS)
         time.sleep(5)   # be polite to SEC EDGAR
     logger.info("=== Daily institutional fetch complete ===")
 
 
 def _run_backfill():
-    """One-time 90-day backfill across all universes — runs in background."""
-    logger.info("=== Institutional backfill starting (all universes, %dd) ===", BACKFILL_DAYS)
-    for ukey in UNIVERSES:
+    """Backfill across all scannable universes (excludes SKIP_SCHEDULED)."""
+    to_scan = [k for k in UNIVERSES if k not in SKIP_SCHEDULED]
+    logger.info("=== Institutional backfill starting (%d universes, %dd) ===",
+                len(to_scan), BACKFILL_DAYS)
+    for ukey in to_scan:
         _run_scan(ukey, BACKFILL_DAYS)
         time.sleep(5)
     logger.info("=== Institutional backfill complete ===")

@@ -1,6 +1,11 @@
 """
 inst-scanner/scanner.py
-SEC EDGAR SC 13D/13G filing fetcher + ownership % extractor.
+SEC EDGAR 13F-HR institutional holdings scanner.
+
+For each ticker, searches EDGAR full-text search (EFTS) for recent 13F-HR
+quarterly filings filed by institutions that hold that stock.
+13F-HR is filed quarterly by every fund manager with >$100M AUM, listing
+all equity holdings — this is the standard institutional ownership dataset.
 """
 
 import os
@@ -12,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
-# ── Universe definitions (mirrors the frontend) ───────────────────────────────
+# ── Universe definitions (fallback — overridden by DB-synced universes) ───────
 UNIVERSES = {
     "portfolio": [
         "ALAB","MRVL","CRDO","IREN","APLD","MU","GFS","FLNC",
@@ -34,8 +39,7 @@ UNIVERSES = {
         "KLAC","LRCX","INTC","MRVL","CDNS","SNPS","MPWR","TER","NXPI","STM",
         "ARM","MCHP","ALAB","ON","SWKS","WOLF",
     ],
-    # Nasdaq-100 as of Aug 7, 2026 (slickcharts.com) — post June 2026 rebalance
-    # Added: ALAB, CRWV, NBIS, RKLB, TER | Removed: CHTR, CTSH, INSM, VRSK, ZS
+    # Nasdaq-100 as of Aug 7 2026 (slickcharts.com) — post June 2026 rebalance
     "ndx100": [
         "NVDA","AAPL","MSFT","AMZN","GOOGL","GOOG","AVGO","META","TSLA","MU",
         "WMT","AMD","ASML","INTC","CSCO","AMAT","COST","PLTR","LRCX","NFLX",
@@ -48,7 +52,7 @@ UNIVERSES = {
         "XEL","NBIS","FER","CCEP","EXC","MCHP","IDXX","AXON","TTWO","ODFL",
         "TRI","WDAY","PAYX","KDP","ROP","MSTR","GEHC","DXCM","KHC","ALNY","CPRT",
     ],
-    # S&P 500 full constituent list. Source: GitHub datasets/s-and-p-500-companies (503 tickers)
+    # S&P 500
     "sp500": [
         "MMM","AOS","ABT","ABBV","ACN","ADBE","AMD","AES","AFL","A","APD","ABNB",
         "AKAM","ALB","ARE","ALGN","ALLE","LNT","ALL","GOOGL","GOOG","MO","AMZN",
@@ -94,164 +98,110 @@ UNIVERSES = {
     ],
 }
 
-INST_FORMS = ["SC 13D", "SC 13G", "SC 13D/A", "SC 13G/A"]
+INST_FORMS = ["13F-HR", "13F-HR/A"]
 
-# SEC requires a meaningful User-Agent — read from env so it matches insider-scanner
-_SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "PoppaAlpha/1.0 research@poppa-alpha.com")
+# SEC requires a meaningful User-Agent — read from env var set in Render environment group
+_SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "OspreyResearch/1.0 research@osprey.com")
 HEADERS = {
     "User-Agent": _SEC_USER_AGENT,
     "Accept-Encoding": "gzip, deflate",
     "Accept": "application/json",
 }
 
-EFTS_URL  = "https://efts.sec.gov/LATEST/search-index"
+EFTS_URL   = "https://efts.sec.gov/LATEST/search-index"
 EDGAR_BASE = "https://www.sec.gov"
 
+# Max institutional filers to return per ticker (13F filings are very common
+# for large-cap stocks — capping prevents returning hundreds of results)
+MAX_FILERS_PER_TICKER = 20
 
-# ── Ownership % extraction ────────────────────────────────────────────────────
-
-_PCT_PATTERNS = [
-    # Row 13 / Item 13 style: "13.  5.2%"
-    re.compile(r"\b1[23][\.\)]\s{0,10}(\d{1,3}(?:\.\d{1,2})?)\s*%", re.IGNORECASE),
-    # "percent of class ... 5.2%"
-    re.compile(r"percent\s+of\s+(?:the\s+)?class[^%\d]{0,60}(\d{1,3}(?:\.\d{1,2})?)\s*%", re.IGNORECASE),
-    # "represents approximately 5.2% of"
-    re.compile(r"represents\s+approximately\s+(\d{1,3}(?:\.\d{1,2})?)\s*%\s+of", re.IGNORECASE),
-    # generic "beneficial ownership of 5.2%"
-    re.compile(r"beneficial\s+ownership\s+of\s+(\d{1,3}(?:\.\d{1,2})?)\s*%", re.IGNORECASE),
-]
-
-
-def _extract_ownership_from_text(text: str):
-    for pat in _PCT_PATTERNS:
-        m = pat.search(text)
-        if m:
-            val = float(m.group(1))
-            if 0.1 <= val <= 99.9:     # sanity: must be a plausible %
-                return round(val, 2)
-    return None
-
-
-def _fetch_filing_document(accession_id: str) -> str | None:
-    """
-    Try to fetch the primary filing document text for an SC 13D/13G
-    and return its raw text. Returns None if it can't be retrieved.
-
-    Accession IDs from EFTS look like '0001234567-26-000123'.
-    """
-    try:
-        # Build the index page URL.
-        # CIK is embedded as the first 10 digits of the accession number.
-        acc_clean = accession_id.replace("-", "")
-        cik       = str(int(acc_clean[:10]))          # strip leading zeros
-        acc_path  = f"{acc_clean[:10]}-{acc_clean[10:12]}-{acc_clean[12:]}"
-        index_url = f"{EDGAR_BASE}/Archives/edgar/data/{cik}/{acc_path}-index.htm"
-
-        resp = requests.get(index_url, headers=HEADERS, timeout=12)
-        if not resp.ok:
-            return None
-
-        # Find the primary document link (not the index itself)
-        doc_links = re.findall(
-            r'href="(/Archives/edgar/data/[^"]+\.(?:htm|html|txt))"',
-            resp.text,
-            re.IGNORECASE,
-        )
-        # Skip the index itself, prefer the shortest path (usually primary doc)
-        doc_links = [l for l in doc_links if "-index" not in l]
-        if not doc_links:
-            return None
-
-        doc_url  = EDGAR_BASE + doc_links[0]
-        doc_resp = requests.get(doc_url, headers=HEADERS, timeout=15)
-        if not doc_resp.ok:
-            return None
-
-        # Strip HTML tags for cleaner regex matching
-        text = re.sub(r"<[^>]+>", " ", doc_resp.text)
-        text = re.sub(r"\s+", " ", text)
-        return text
-
-    except Exception as exc:
-        logger.debug("fetch_filing_document error: %s", exc)
-        return None
-
-
-def extract_ownership(accession_id: str) -> float | None:
-    """Fetch the filing and try to extract ownership percentage."""
-    doc_text = _fetch_filing_document(accession_id)
-    if doc_text:
-        return _extract_ownership_from_text(doc_text)
-    return None
+# Minimum shares threshold — filter out trivially small positions
+MIN_SHARES = 1000
 
 
 # ── EDGAR EFTS search ─────────────────────────────────────────────────────────
 
 def fetch_filings_for_ticker(ticker: str, start_date: str) -> list[dict]:
     """
-    Search EDGAR EFTS for 13D/13G filings mentioning `ticker`
-    filed on or after `start_date` (YYYY-MM-DD).
-    Returns a list of filing dicts.
+    Search EDGAR EFTS for 13F-HR filings mentioning ticker, filed on or
+    after start_date (YYYY-MM-DD).
+
+    13F-HR filings are quarterly institutional ownership reports. Many filers
+    include the ticker symbol in their information table, so EFTS full-text
+    search finds them reliably for most tickers.
+
+    Returns a list of institutional holder dicts sorted by filed_date desc.
     """
-    forms_param = ",".join(INST_FORMS)
     params = {
-        "q":          f'"{ticker}"',
-        "forms":      forms_param,
-        "dateRange":  "custom",
-        "startdt":    start_date,
+        "q":         f'"{ticker}"',
+        "forms":     "13F-HR,13F-HR/A",
+        "dateRange": "custom",
+        "startdt":   start_date,
+        "from":      0,
+        "size":      MAX_FILERS_PER_TICKER,
     }
     try:
         resp = requests.get(EFTS_URL, params=params, headers=HEADERS, timeout=15)
         resp.raise_for_status()
         data = resp.json()
     except Exception as exc:
-        logger.warning("EDGAR search error for %s: %s", ticker, exc)
+        logger.warning("EDGAR EFTS error for %s: %s", ticker, exc)
         return []
 
-    hits = (data.get("hits") or {}).get("hits") or []
-    filings = []
+    hits  = (data.get("hits") or {}).get("hits") or []
+    total = (data.get("hits") or {}).get("total", {}).get("value", 0)
+
+    results = []
     for h in hits:
         src  = h.get("_source") or {}
         form = src.get("form_type", "")
         if form not in INST_FORMS:
             continue
 
-        # Company name from display_names (may list multiple, take first)
-        display = src.get("display_names") or ""
-        company = display.split(";")[0].strip() if display else "—"
+        period_raw = src.get("period_of_report") or ""
+        # Format period as "Q2 2026" style
+        period_label = _format_period(period_raw)
 
-        accession = (h.get("_id") or "").replace(":", "-")
-
-        filings.append({
-            "ticker":        ticker,
-            "company":       company,
-            "form":          form,
-            "filer":         src.get("entity_name") or "—",
-            "ownership_pct": None,          # filled below
-            "filed_date":    src.get("file_date") or "—",
-            "accession":     accession,
+        results.append({
+            "ticker":      ticker,
+            "filer":       src.get("entity_name") or "—",
+            "form":        form,
+            "filed_date":  src.get("file_date") or "—",
+            "period":      period_label,
+            "period_raw":  period_raw,
+            "shares":      None,   # populated by enrich step (optional)
+            "value_k":     None,   # populated by enrich step (optional)
+            "accession":   (h.get("_id") or "").replace(":", "-"),
+            "total_filers": total,
         })
 
-    return filings
+    return results
 
 
-def enrich_ownership(filing: dict, delay: float = 0.4) -> dict:
-    """Attempt to fill in ownership_pct by fetching the actual filing doc."""
-    time.sleep(delay)
+def _format_period(period_raw: str) -> str:
+    """Convert EDGAR period_of_report (YYYY-MM-DD) to 'Q2 2026' style."""
+    if not period_raw or len(period_raw) < 7:
+        return period_raw or "—"
     try:
-        pct = extract_ownership(filing["accession"])
-        filing["ownership_pct"] = pct
-    except Exception as exc:
-        logger.debug("ownership extraction failed (%s): %s", filing["accession"], exc)
-    return filing
+        year  = int(period_raw[:4])
+        month = int(period_raw[5:7])
+        q = (month - 1) // 3 + 1
+        return f"Q{q} {year}"
+    except Exception:
+        return period_raw
 
 
 # ── Batch scan ────────────────────────────────────────────────────────────────
 
 def scan_tickers(tickers: list, days: int = 90, enrich: bool = True) -> list[dict]:
     """
-    Scan a list of tickers for recent 13D/13G filings.
-    If `enrich` is True, attempt ownership % extraction for each filing.
+    Scan a list of tickers for recent 13F-HR institutional filings.
+
+    For each ticker, returns up to MAX_FILERS_PER_TICKER institutional filers
+    that recently filed a 13F-HR mentioning that ticker.
+
+    Note: enrich parameter kept for API compatibility but position-size
+    extraction is not yet implemented (requires downloading each filing XML).
     """
     start_date = (
         datetime.now(timezone.utc) - timedelta(days=days)
@@ -261,12 +211,11 @@ def scan_tickers(tickers: list, days: int = 90, enrich: bool = True) -> list[dic
     for sym in tickers:
         filings = fetch_filings_for_ticker(sym, start_date)
         if filings:
-            logger.info("  %s: %d filing(s)", sym, len(filings))
-            if enrich:
-                filings = [enrich_ownership(f) for f in filings]
+            total = filings[0].get("total_filers", len(filings))
+            logger.info("  %s: %d filers (showing %d of %d)", sym, len(filings), len(filings), total)
         else:
             logger.info("  %s: no filings", sym)
         all_filings.extend(filings)
-        time.sleep(0.25)    # be polite to SEC servers
+        time.sleep(0.3)   # be polite to SEC EDGAR
 
     return all_filings
