@@ -77,10 +77,7 @@ DEFAULT_DAYS = 90
 BACKFILL_DAYS = 90          # lookback for scheduled + backfill runs
 SCAN_WINDOWS  = [90]        # days lookbacks to pre-cache
 
-# Universes excluded from scheduled daily scans and backfills — too many
-# tickers to scan via EDGAR (sp500 = 500 tickers, ndx100 = 100 tickers).
-# Users can still trigger manual Run Scan for these from the UI.
-SKIP_SCHEDULED = {"sp500", "ndx100"}
+SKIP_SCHEDULED = set()   # no universes excluded from scheduled scans
 
 
 # ── Scanner logic ─────────────────────────────────────────────────────────────
