@@ -267,11 +267,17 @@ def sync_universes():
     if not valid:
         return jsonify({"error": "No valid universe objects found"}), 400
 
-    # Merge into live UNIVERSES dict
+    # Full replace of custom universes in live UNIVERSES dict:
+    # 1. Remove any keys that were previously synced but aren't in this payload
+    incoming_keys = {u["key"] for u in valid}
+    stale = [k for k in list(UNIVERSES.keys()) if k not in incoming_keys and k not in _BASE_UNIVERSES]
+    for k in stale:
+        UNIVERSES.pop(k, None)
+    # 2. Upsert the incoming set
     for u in valid:
         UNIVERSES[u["key"]] = u["tickers"]
 
-    # Persist to DB
+    # Persist to DB (full replace — deletes stale rows too)
     db.save_custom_universes(valid)
 
     logger.info("Synced %d universes from frontend. Total UNIVERSES: %d", len(valid), len(UNIVERSES))

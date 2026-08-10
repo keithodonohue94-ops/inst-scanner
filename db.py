@@ -62,14 +62,28 @@ def init_db():
 
 
 def save_custom_universes(universes: list):
-    """Upsert custom universe definitions. universes = [{key, name, tickers}]"""
+    """
+    Full replace of custom universe definitions.
+    Universes NOT in the incoming list are deleted; the rest are upserted.
+    universes = [{key, name, tickers}]
+    """
     if not _USE_PG:
         return
     try:
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat()
+        incoming_keys = [u["key"] for u in universes]
         conn = _conn()
         cur = conn.cursor()
+        # Delete universes no longer in the frontend list
+        if incoming_keys:
+            cur.execute(
+                "DELETE FROM inst_custom_universes WHERE key != ALL(%s)",
+                (incoming_keys,)
+            )
+        else:
+            cur.execute("DELETE FROM inst_custom_universes")
+        # Upsert the current set
         for u in universes:
             cur.execute("""
                 INSERT INTO inst_custom_universes (key, name, tickers, updated_at)
@@ -82,7 +96,7 @@ def save_custom_universes(universes: list):
         conn.commit()
         cur.close()
         conn.close()
-        logger.info("Saved %d custom universes to DB", len(universes))
+        logger.info("Universe sync: %d universes active in DB", len(universes))
     except Exception as e:
         logger.error("save_custom_universes failed: %s", e)
 
