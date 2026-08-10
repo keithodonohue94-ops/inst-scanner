@@ -23,8 +23,12 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from scanner import scan_tickers, UNIVERSES
+from scanner import scan_tickers, UNIVERSES as _BASE_UNIVERSES
 import db
+
+# Mutable universe registry — starts from scanner.py defaults, then
+# custom universes loaded from DB (and synced from the frontend) are merged in.
+UNIVERSES: dict = dict(_BASE_UNIVERSES)
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -180,12 +184,8 @@ def results():
         data = CACHE.get(key)
 
     if not data:
-        # Auto-trigger a scan if we have nothing yet
-        if universe in UNIVERSES and key not in SCANNING:
-            t = threading.Thread(
-                target=_run_scan, args=(universe, days), daemon=True
-            )
-            t.start()
+        # No cached data — return no_data without auto-triggering a scan.
+        # Data is populated by the daily scheduled fetch or explicit Run Scan.
         return jsonify({
             "status":     "no_data",
             "results":    [],
@@ -244,6 +244,44 @@ def poll():
     return jsonify({"ready": False, "scanning": scanning})
 
 
+@app.route("/api/universes/sync", methods=["POST"])
+def sync_universes():
+    """
+    Receive universe definitions from the frontend and persist them to DB.
+    Body: [{"key": "aiinfra", "name": "AI Infrastructure", "tickers": ["NVDA", ...]}]
+    Merges into the live UNIVERSES dict so the daily fetch picks them up.
+    """
+    universes = request.get_json(silent=True)
+    if not isinstance(universes, list):
+        return jsonify({"error": "Expected a JSON array of universe objects"}), 400
+
+    valid = []
+    for u in universes:
+        key     = u.get("key", "").strip()
+        name    = u.get("name", "").strip()
+        tickers = u.get("tickers", [])
+        if not key or not name or not isinstance(tickers, list) or not tickers:
+            continue
+        valid.append({"key": key, "name": name, "tickers": tickers})
+
+    if not valid:
+        return jsonify({"error": "No valid universe objects found"}), 400
+
+    # Merge into live UNIVERSES dict
+    for u in valid:
+        UNIVERSES[u["key"]] = u["tickers"]
+
+    # Persist to DB
+    db.save_custom_universes(valid)
+
+    logger.info("Synced %d universes from frontend. Total UNIVERSES: %d", len(valid), len(UNIVERSES))
+    return jsonify({
+        "status":   "ok",
+        "synced":   len(valid),
+        "universes": list(UNIVERSES.keys()),
+    })
+
+
 @app.route("/api/backfill", methods=["POST"])
 def trigger_backfill():
     """
@@ -272,7 +310,14 @@ def _startup():
     # 1. Initialise DB schema
     db.init_db()
 
-    # 2. Load any previously saved results from PostgreSQL into memory
+    # 2. Load persisted custom universe definitions and merge into UNIVERSES
+    custom = db.load_custom_universes()
+    for u in custom:
+        UNIVERSES[u["key"]] = u["tickers"]
+    if custom:
+        logger.info("Loaded %d custom universes from DB. Total UNIVERSES: %d", len(custom), len(UNIVERSES))
+
+    # 3. Load any previously saved results from PostgreSQL into memory
     #    so results are available immediately after a redeploy
     cached = db.load_all_cached()
     if cached:

@@ -28,7 +28,7 @@ def _conn():
 
 
 def init_db():
-    """Create inst_scan_cache table if it doesn't exist."""
+    """Create inst_scan_cache and inst_custom_universes tables if they don't exist."""
     if not _USE_PG:
         return
     try:
@@ -45,12 +45,65 @@ def init_db():
                 UNIQUE(universe, days)
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS inst_custom_universes (
+                key      TEXT PRIMARY KEY,
+                name     TEXT NOT NULL,
+                tickers  TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
         conn.commit()
         cur.close()
         conn.close()
-        logger.info("inst_scan_cache table ready")
+        logger.info("inst_scan_cache + inst_custom_universes tables ready")
     except Exception as e:
         logger.error("init_db failed: %s", e)
+
+
+def save_custom_universes(universes: list):
+    """Upsert custom universe definitions. universes = [{key, name, tickers}]"""
+    if not _USE_PG:
+        return
+    try:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        conn = _conn()
+        cur = conn.cursor()
+        for u in universes:
+            cur.execute("""
+                INSERT INTO inst_custom_universes (key, name, tickers, updated_at)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (key) DO UPDATE SET
+                    name       = EXCLUDED.name,
+                    tickers    = EXCLUDED.tickers,
+                    updated_at = EXCLUDED.updated_at
+            """, (u["key"], u["name"], json.dumps(u["tickers"]), now))
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("Saved %d custom universes to DB", len(universes))
+    except Exception as e:
+        logger.error("save_custom_universes failed: %s", e)
+
+
+def load_custom_universes() -> list:
+    """Load custom universe definitions from DB. Returns [{key, name, tickers}]"""
+    if not _USE_PG:
+        return []
+    try:
+        conn = _conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute("SELECT key, name, tickers FROM inst_custom_universes ORDER BY key")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        result = [{"key": r["key"], "name": r["name"], "tickers": json.loads(r["tickers"])} for r in rows]
+        logger.info("Loaded %d custom universes from DB", len(result))
+        return result
+    except Exception as e:
+        logger.error("load_custom_universes failed: %s", e)
+        return []
 
 
 def save_scan(universe: str, days: int, scanned_at: str, results: list):
