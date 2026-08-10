@@ -73,9 +73,9 @@ CACHE: dict = {}
 SCANNING: set = set()
 _cache_lock = threading.Lock()
 
-DEFAULT_DAYS = 90
-BACKFILL_DAYS = 90          # lookback for scheduled + backfill runs
-SCAN_WINDOWS  = [90]        # days lookbacks to pre-cache
+DEFAULT_DAYS = 180
+BACKFILL_DAYS = 180         # 180 days covers two full quarters of 13F filings
+SCAN_WINDOWS  = [180]       # days lookbacks to pre-cache
 
 SKIP_SCHEDULED = set()   # no universes excluded from scheduled scans
 
