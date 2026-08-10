@@ -3,6 +3,7 @@ inst-scanner/scanner.py
 SEC EDGAR SC 13D/13G filing fetcher + ownership % extractor.
 """
 
+import os
 import re
 import time
 import logging
@@ -95,9 +96,10 @@ UNIVERSES = {
 
 INST_FORMS = ["SC 13D", "SC 13G", "SC 13D/A", "SC 13G/A"]
 
-# SEC requires a meaningful User-Agent
+# SEC requires a meaningful User-Agent — read from env so it matches insider-scanner
+_SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "PoppaAlpha/1.0 research@poppa-alpha.com")
 HEADERS = {
-    "User-Agent": "PoppaAlpha/1.0 research@poppa-alpha.com",
+    "User-Agent": _SEC_USER_AGENT,
     "Accept-Encoding": "gzip, deflate",
     "Accept": "application/json",
 }
