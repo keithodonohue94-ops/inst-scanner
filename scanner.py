@@ -111,29 +111,69 @@ HEADERS = {
 EFTS_URL   = "https://efts.sec.gov/LATEST/search-index"
 EDGAR_BASE = "https://www.sec.gov"
 
-# Max institutional filers to return per ticker (13F filings are very common
-# for large-cap stocks — capping prevents returning hundreds of results)
+# Max institutional filers to return per ticker
 MAX_FILERS_PER_TICKER = 20
 
-# Minimum shares threshold — filter out trivially small positions
-MIN_SHARES = 1000
+# 13F information tables use full company names, NOT ticker symbols.
+# Map ticker → search phrase that will appear in the 13F nameOfIssuer field.
+# EFTS full-text search on 13F XML uses company names, not tickers.
+TICKER_SEARCH_NAME = {
+    "NVDA":  "NVIDIA",            "AMD":   "ADVANCED MICRO DEVICES",
+    "INTC":  "INTEL CORP",        "AVGO":  "BROADCOM",
+    "MU":    "MICRON TECHNOLOGY", "AMAT":  "APPLIED MATERIALS",
+    "TSM":   "TAIWAN SEMICONDUCTOR", "KLAC": "KLA CORP",
+    "LRCX":  "LAM RESEARCH",      "TXN":   "TEXAS INSTRUMENTS",
+    "MRVL":  "MARVELL",           "ADI":   "ANALOG DEVICES",
+    "MPWR":  "MONOLITHIC POWER",  "NXPI":  "NXP SEMICONDUCTORS",
+    "TER":   "TERADYNE",          "QCOM":  "QUALCOMM",
+    "ASML":  "ASML",              "ALAB":  "ASTERA LABS",
+    "MCHP":  "MICROCHIP TECHNOLOGY", "CRDO": "CREDO TECHNOLOGY",
+    "ON":    "ON SEMICONDUCTOR",  "ENTG":  "ENTEGRIS",
+    "CDNS":  "CADENCE DESIGN",    "SNPS":  "SYNOPSYS",
+    "ARM":   "ARM HOLDINGS",      "ANET":  "ARISTA NETWORKS",
+    "SMCI":  "SUPER MICRO COMPUTER", "VRT": "VERTIV",
+    "ETN":   "EATON CORP",        "PWR":   "QUANTA SERVICES",
+    "PLTR":  "PALANTIR",          "CRWD":  "CROWDSTRIKE",
+    "PANW":  "PALO ALTO NETWORKS","MSFT":  "MICROSOFT",
+    "AAPL":  "APPLE INC",         "AMZN":  "AMAZON",
+    "GOOGL": "ALPHABET",          "GOOG":  "ALPHABET",
+    "META":  "META PLATFORMS",    "TSLA":  "TESLA",
+    "IREN":  "IRIS ENERGY",       "MOD":   "MODINE",
+    "STRL":  "STERLING INFRASTRUCTURE", "FLNC": "FLUENCE ENERGY",
+    "GFS":   "GLOBALFOUNDRIES",   "APLD":  "APPLIED DIGITAL",
+    "VICR":  "VICOR CORP",        "ORA":   "ORMAT TECHNOLOGIES",
+    "ALAB":  "ASTERA LABS",       "LITE":  "LUMENTUM",
+    "ENPH":  "ENPHASE ENERGY",    "FSLR":  "FIRST SOLAR",
+    "NEE":   "NEXTERA ENERGY",    "CEG":   "CONSTELLATION ENERGY",
+    "VST":   "VISTRA CORP",       "NRG":   "NRG ENERGY",
+    "PLUG":  "PLUG POWER",        "RUN":   "SUNRUN",
+    "MP":    "MP MATERIALS",      "RKLB":  "ROCKET LAB",
+    "ASTS":  "AST SPACEMOBILE",   "LUNR":  "INTUITIVE MACHINES",
+    "BKSY":  "BLACKSKY TECHNOLOGY","PL":   "PLANET LABS",
+    "SPCE":  "VIRGIN GALACTIC",   "RDW":   "REDWIRE CORP",
+    "S":     "SENTINELONE",       "OKTA":  "OKTA INC",
+    "ZS":    "ZSCALER",           "NET":   "CLOUDFLARE",
+    "FTNT":  "FORTINET",          "CYBR":  "CYBERARK SOFTWARE",
+    "TENB":  "TENABLE HOLDINGS",  "QLYS":  "QUALYS",
+}
 
 
 # ── EDGAR EFTS search ─────────────────────────────────────────────────────────
 
 def fetch_filings_for_ticker(ticker: str, start_date: str) -> list[dict]:
     """
-    Search EDGAR EFTS for 13F-HR filings mentioning ticker, filed on or
-    after start_date (YYYY-MM-DD).
+    Search EDGAR EFTS for 13F-HR filings mentioning the company held.
 
-    13F-HR filings are quarterly institutional ownership reports. Many filers
-    include the ticker symbol in their information table, so EFTS full-text
-    search finds them reliably for most tickers.
+    13F information tables use full company names (e.g. "NVIDIA CORP"), not
+    ticker symbols. We map each ticker to its EDGAR company name and search
+    that phrase in 13F-HR filings.
 
     Returns a list of institutional holder dicts sorted by filed_date desc.
     """
+    # Use company name for search — 13F XML uses nameOfIssuer not ticker
+    search_term = TICKER_SEARCH_NAME.get(ticker.upper(), ticker.upper())
     params = {
-        "q":         f'"{ticker}"',
+        "q":         f'"{search_term}"',
         "forms":     "13F-HR,13F-HR/A",
         "dateRange": "custom",
         "startdt":   start_date,
