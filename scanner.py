@@ -122,7 +122,8 @@ TOP_INSTITUTIONS = [
     ("Citadel Advisors",          1423298),
     ("Millennium Management",     1273931),
     ("Renaissance Technologies",  1037389),
-    ("Two Sigma Investments",     1536411),
+    ("Duquesne Family Office",     1536411),   # Druckenmiller — CIK confirmed
+    ("Two Sigma Investments",     1447362),   # Two Sigma Investments LP
     ("D.E. Shaw",                 1009207),
     ("AQR Capital Management",   1280790),
     ("Coatue Management",         1336528),
