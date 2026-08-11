@@ -17,7 +17,7 @@ import logging
 import hmac
 import hashlib
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -153,7 +153,26 @@ def _run_backfill():
 
 @app.route("/api/health")
 def health():
-    return jsonify({"status": "ok", "timestamp": _now()})
+    db_ok = False
+    db_rows = 0
+    try:
+        import psycopg2
+        conn = psycopg2.connect(db.DATABASE_URL) if db.DATABASE_URL else None
+        if conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM inst_scan_cache")
+            db_rows = cur.fetchone()[0]
+            cur.close()
+            conn.close()
+            db_ok = True
+    except Exception as e:
+        logger.warning("Health DB check failed: %s", e)
+    return jsonify({
+        "status":    "ok",
+        "timestamp": _now(),
+        "db":        {"connected": db_ok, "cached_rows": db_rows},
+        "cache":     len(CACHE),
+    })
 
 
 @app.route("/api/stats")
@@ -184,14 +203,11 @@ def stats():
 def results():
     universe = request.args.get("universe", "portfolio")
     days     = int(request.args.get("days", DEFAULT_DAYS))
-    key      = _cache_key(universe, days)
 
-    with _cache_lock:
-        data = CACHE.get(key)
+    # Always read from DB — source of truth. No in-memory cache dependency.
+    data = db.load_scan(universe, days)
 
     if not data:
-        # No cached data — return no_data without auto-triggering a scan.
-        # Data is populated by the daily scheduled fetch or explicit Run Scan.
         return jsonify({
             "status":     "no_data",
             "results":    [],
@@ -237,6 +253,13 @@ def poll():
 
     with _cache_lock:
         data = CACHE.get(key)
+
+    # Cache miss — check DB (scan may have completed on a different worker)
+    if not data:
+        data = db.load_scan(universe, days)
+        if data:
+            with _cache_lock:
+                CACHE[key] = data
 
     scanning = key in SCANNING
     if data:
@@ -294,6 +317,66 @@ def sync_universes():
     })
 
 
+@app.route("/api/verify-ciks")
+def verify_ciks():
+    """
+    Check every hardcoded institution CIK against EDGAR and return
+    the actual entity name. Use this to catch wrong CIK mappings.
+    """
+    from scanner import TOP_INSTITUTIONS, _sec_get, SUBMISSIONS_BASE, _padded_cik
+    results = []
+    for display_name, cik in TOP_INSTITUTIONS:
+        url = f"{SUBMISSIONS_BASE}/CIK{_padded_cik(cik)}.json"
+        resp = _sec_get(url, timeout=10)
+        actual_name = None
+        if resp and resp.ok:
+            try:
+                actual_name = resp.json().get("name")
+            except Exception:
+                pass
+        results.append({
+            "our_label":   display_name,
+            "cik":         cik,
+            "actual_name": actual_name,
+            "match":       display_name.split()[0].upper() in (actual_name or "").upper(),
+        })
+    return jsonify(results)
+
+
+@app.route("/api/test-institution")
+def test_institution():
+    """
+    Diagnostic endpoint — test a single institution end-to-end.
+    Usage: /api/test-institution?name=VANGUARD+GROUP&days=270
+    Returns raw EFTS hits, filing info, first 5 XML lines, and any matched tickers.
+    """
+    from scanner import _find_institution_13f, _get_info_table_xml, _parse_holdings, TICKER_NAME_MAP
+    name = request.args.get("name", "VANGUARD GROUP")
+    days = int(request.args.get("days", 270))
+    sample_tickers = {"NVDA", "AAPL", "MSFT", "AMZN", "META", "AMD", "AVGO", "TSLA"}
+
+    start_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+    filing = _find_institution_13f(name, start_date)
+    if not filing:
+        return jsonify({"institution": name, "filing": None, "error": "No 13F found via EFTS"})
+
+    xml = _get_info_table_xml(filing["cik"], filing["accession"])
+    xml_preview = xml[:500] if xml else None
+    xml_len = len(xml) if xml else 0
+
+    holdings = _parse_holdings(xml, sample_tickers) if xml else []
+
+    return jsonify({
+        "institution": name,
+        "filing":      filing,
+        "xml_found":   xml is not None,
+        "xml_bytes":   xml_len,
+        "xml_preview": xml_preview,
+        "matched_holdings": holdings,
+    })
+
+
 @app.route("/api/backfill", methods=["POST"])
 def trigger_backfill():
     """
@@ -329,18 +412,14 @@ def _startup():
     if custom:
         logger.info("Loaded %d custom universes from DB. Total UNIVERSES: %d", len(custom), len(UNIVERSES))
 
-    # 3. Load any previously saved results from PostgreSQL into memory
-    #    so results are available immediately after a redeploy
+    # 3. Check if DB has any data; if not, kick off initial backfill
     cached = db.load_all_cached()
-    if cached:
-        with _cache_lock:
-            CACHE.update(cached)
-        logger.info("Cache pre-loaded from DB (%d entries)", len(cached))
-    else:
-        # No DB data yet — kick off a full backfill in background
+    if not cached:
         logger.info("No cached data in DB — triggering initial backfill")
         t = threading.Thread(target=_run_backfill, daemon=True)
         t.start()
+    else:
+        logger.info("DB has %d cached scans — results served directly from DB on request", len(cached))
 
     # 3. Daily scheduler at 12:00 UTC = 7:00 AM EST
     scheduler = BackgroundScheduler()

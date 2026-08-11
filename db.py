@@ -143,6 +143,34 @@ def save_scan(universe: str, days: int, scanned_at: str, results: list):
         logger.error("save_scan failed: %s", e)
 
 
+def load_scan(universe: str, days: int) -> dict | None:
+    """Load a single universe/days entry from DB. Returns None if not found."""
+    if not _USE_PG:
+        return None
+    try:
+        conn = _conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute(
+            "SELECT universe, days, scanned_at, results, count FROM inst_scan_cache WHERE universe=%s AND days=%s",
+            (universe, days)
+        )
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not row:
+            return None
+        return {
+            "results":    json.loads(row["results"]),
+            "scanned_at": row["scanned_at"],
+            "count":      row["count"],
+            "universe":   row["universe"],
+            "days":       row["days"],
+        }
+    except Exception as e:
+        logger.error("load_scan failed (%s/%dd): %s", universe, days, e)
+        return None
+
+
 def load_all_cached() -> dict:
     """
     Load all persisted scan results from DB.
