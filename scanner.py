@@ -1,15 +1,16 @@
 """
 inst-scanner/scanner.py
-SEC EDGAR 13F-HR institutional holdings scanner — institution-first approach.
+SEC EDGAR 13F-HR institutional holdings scanner.
 
-EDGAR EFTS full-text search does NOT index 13F holdings data (the info table
-XML is not text-indexed). The only reliable approach is:
-  1. Search EDGAR for each top institution's 13F-HR filing by filer name
-  2. Download the filing's information table XML
-  3. Parse holdings and filter for our universe tickers
+Approach: hardcoded CIKs for top ~25 institutional investors.
+For each institution:
+  1. Fetch their filing history via data.sec.gov/submissions/CIK{cik}.json
+  2. Find the most recent 13F-HR within the lookback window
+  3. Download the information table XML from the filing directory
+  4. Parse holdings and match against our universe tickers
 
-Each institution files ONE 13F-HR per quarter listing ALL their equity holdings.
-We check the top ~20 institutions and match their holdings to our universe tickers.
+This mirrors exactly how the insider scanner fetches Form 4 — submissions API,
+no EFTS full-text search (which does not index 13F holdings data).
 """
 
 import os
@@ -41,60 +42,23 @@ UNIVERSES = {
         "KLAC","LRCX","INTC","MRVL","CDNS","SNPS","MPWR","TER","NXPI","STM",
         "ARM","MCHP","ALAB","ON","SWKS","WOLF",
     ],
-    "ndx100": [
-        "NVDA","AAPL","MSFT","AMZN","GOOGL","GOOG","AVGO","META","TSLA","MU",
-        "WMT","AMD","ASML","INTC","CSCO","AMAT","COST","PLTR","LRCX","NFLX",
-        "ARM","PANW","TXN","KLAC","LIN","AMGN","CRWD","MRVL","SHOP","ADI",
-        "TMUS","PEP","STX","SNDK","QCOM","GILD","BKNG","WDC","ISRG","PDD",
-        "VRTX","SBUX","FTNT","APP","ADP","ADBE","ABNB","CEG","DASH","CSX",
-        "CDNS","MAR","MELI","CMCSA","INTU","MNST","DDOG","ROST","CTAS","REGN",
-        "MDLZ","SNPS","HON","ORLY","PCAR","LITE","AEP","MPWR","WBD","BKR",
-        "NXPI","TER","FAST","ALAB","FANG","ADSK","HONA","RKLB","PYPL","CRWV",
-        "XEL","NBIS","FER","CCEP","EXC","MCHP","IDXX","AXON","TTWO","ODFL",
-        "TRI","WDAY","PAYX","KDP","ROP","MSTR","GEHC","DXCM","KHC","ALNY","CPRT",
+    "aiinfra": [
+        "ETN","PWR","LITE","MOD","STRL","ANET","CLS","MRVL","MPWR","CRDO",
+        "VRT","NVDA","SMCI","ALAB","MU","AMD","QCOM","ARM","TSM","AVGO",
+        "LRCX","AMAT","KLAC","ADI","TXN","SNPS","CDNS","IREN","APLD","GFS",
     ],
-    "sp500": [
-        "MMM","AOS","ABT","ABBV","ACN","ADBE","AMD","AES","AFL","A","APD","ABNB",
-        "AKAM","ALB","ARE","ALGN","ALLE","LNT","ALL","GOOGL","GOOG","MO","AMZN",
-        "AMCR","AEE","AEP","AXP","AIG","AMT","AWK","AMP","AME","AMGN","APH","ADI",
-        "AON","APA","APO","AAPL","AMAT","APP","APTV","ACGL","ADM","ARES","ANET",
-        "AJG","AIZ","T","ATO","ADSK","ADP","AZO","AVB","AVY","AXON","BKR","BALL",
-        "BAC","BAX","BDX","BRK.B","BBY","TECH","BIIB","BLK","BX","BNY","BA","BKNG",
-        "BSX","BMY","AVGO","BR","BRO","BF.B","BLDR","BG","BXP","CHRW","CDNS","CPT",
-        "COF","CAH","CCL","CARR","CVNA","CASY","CAT","CBOE","CBRE","CDW","COR","CNC",
-        "CNP","CF","CRL","SCHW","CHTR","CVX","CMG","CB","CHD","CIEN","CI","CINF",
-        "CTAS","CSCO","C","CFG","CLX","CME","CMS","KO","CTSH","COHR","COIN","CL",
-        "CMCSA","FIX","CAG","COP","ED","STZ","CEG","COO","CPRT","GLW","CPAY","CTVA",
-        "CSGP","COST","CRH","CRWD","CCI","CSX","CMI","CVS","DHR","DRI","DDOG","DVA",
-        "DECK","DE","DELL","DAL","DVN","DXCM","FANG","DLR","DG","DLTR","D","DPZ",
-        "DASH","DOV","DOW","DHI","DTE","DUK","DD","ETN","EBAY","ECL","EIX","EW","EA",
-        "ELV","EME","EMR","ETR","EOG","EQT","EFX","EQIX","EQR","ERIE","ESS","EL","EG",
-        "EVRG","ES","EXC","EXE","EXPE","EXPD","EXR","XOM","FFIV","FDS","FICO","FAST",
-        "FRT","FDX","FIS","FITB","FSLR","FE","FISV","FLEX","F","FTNT","FTV","FOXA",
-        "FOX","BEN","FCX","GRMN","IT","GE","GEHC","GEV","GEN","GNRC","GD","GIS","GM",
-        "GPC","GILD","GPN","GL","GDDY","GS","HAL","HIG","HAS","HCA","DOC","HSIC","HSY",
-        "HPE","HLT","HD","HONA","HON","HRL","HST","HWM","HPQ","HUBB","HUM","HBAN","HII",
-        "IBM","IEX","IDXX","ITW","INCY","IR","PODD","INTC","IBKR","ICE","IFF","IP",
-        "INTU","ISRG","IVZ","INVH","IQV","IRM","JBHT","JBL","JKHY","J","JNJ","JCI",
-        "JPM","KVUE","KDP","KEY","KEYS","KMB","KIM","KMI","KKR","KLAC","KHC","KR",
-        "LHX","LH","LRCX","LVS","LDOS","LEN","LII","LLY","LIN","LYV","LMT","L","LOW",
-        "LULU","LITE","LYB","MTB","MPC","MAR","MLM","MAS","MA","MKC","MCD","MCK","MDT",
-        "MRK","META","MET","MTD","MGM","MCHP","MU","MSFT","MAA","MRNA","TAP","MDLZ",
-        "MPWR","MNST","MCO","MS","MOS","MSI","MSCI","NDAQ","NTAP","NFLX","NEM","NWSA",
-        "NWS","NEE","NKE","NI","NDSN","NSC","NTRS","NOC","NCLH","NRG","NUE","NVDA",
-        "NVR","NXPI","ORLY","OXY","ODFL","OMC","ON","OKE","ORCL","OTIS","PCAR","PKG",
-        "PLTR","PANW","PH","PAYX","PYPL","PNR","PEP","PFE","PCG","PM","PSX","PNW","PNC",
-        "POOL","PPG","PPL","PFG","PG","PGR","PLD","PRU","PEG","PTC","PSA","PHM","PWR",
-        "QCOM","DGX","Q","RL","RJF","RTX","O","REG","REGN","RF","RSG","RMD","RVTY",
-        "HOOD","ROK","ROL","ROP","ROST","RCL","SPGI","CRM","SNDK","SBAC","SLB","STX",
-        "SRE","NOW","SHW","SPG","SWKS","SJM","SW","SNA","SOLV","SO","LUV","SWK","SBUX",
-        "STT","STLD","STE","SYK","SMCI","SYF","SNPS","SYY","TMUS","TROW","TTWO","TPR",
-        "TRGP","TGT","TEL","TDY","TER","TSLA","TXN","TPL","TXT","TMO","TJX","TKO","TTD",
-        "TSCO","TT","TDG","TRV","TRMB","TFC","TYL","TSN","USB","UBER","UDR","ULTA","UNP",
-        "UAL","UPS","URI","UNH","UHS","VLO","VEEV","VTR","VLTO","VRSN","VRSK","VZ",
-        "VRTX","VRT","VTRS","VICI","V","VST","VMC","WRB","GWW","WAB","WMT","DIS","WBD",
-        "WM","WAT","WEC","WFC","WELL","WST","WDC","WY","WSM","WMB","WTW","WDAY","WYNN",
-        "XEL","XYL","YUM","ZBRA","ZBH","ZTS",
+    "cybersec": [
+        "S","QLYS","OKTA","CRWD","PANW","ZS","NET","FTNT","CYBR","TENB",
+    ],
+    "energy": [
+        "ENPH","VICR","ORA","FLNC","CEG","VST","ETR","FSLR","NEE",
+        "WULF","NRG","RUN","PLUG","NNE","OKLO","CCJ","SMR",
+    ],
+    "orbital": [
+        "BKSY","PLTR","PL","RDW","RKLB","ASTS","LUNR","SPCE",
+    ],
+    "rareearths": [
+        "MP","IDR","USAR","TMC","UUUU","DNN",
     ],
 }
 
@@ -104,45 +68,71 @@ _SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "OspreyResearch/1.0 research@ospre
 HEADERS = {
     "User-Agent": _SEC_USER_AGENT,
     "Accept-Encoding": "gzip, deflate",
-    "Accept": "application/json",
 }
 
-EFTS_URL   = "https://efts.sec.gov/LATEST/search-index"
-EDGAR_BASE = "https://www.sec.gov"
+EDGAR_BASE       = "https://www.sec.gov"
+SUBMISSIONS_BASE = "https://data.sec.gov/submissions"
 
-# ── Top institutions to check ─────────────────────────────────────────────────
-# Search terms used to find each institution's 13F filing via EDGAR EFTS.
-# These match the entity_name field in EDGAR filings.
+_SEC_BASE_DELAY = 0.5   # 500ms between requests
+
+def _sec_get(url: str, params: dict = None, extra_headers: dict = None,
+             timeout: int = 20, retries: int = 4) -> requests.Response | None:
+    """GET a SEC EDGAR URL with exponential backoff on 429."""
+    hdrs = {**HEADERS, **(extra_headers or {})}
+    backoff = 30
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, params=params, headers=hdrs, timeout=timeout)
+        except Exception as exc:
+            logger.debug("SEC GET error %s: %s", url[-60:], exc)
+            time.sleep(_SEC_BASE_DELAY)
+            return None
+
+        if resp.status_code == 429:
+            wait = backoff * (2 ** attempt)
+            logger.warning("429 rate-limited — waiting %ds (attempt %d/%d)", wait, attempt + 1, retries)
+            time.sleep(wait)
+            continue
+
+        time.sleep(_SEC_BASE_DELAY)
+        return resp
+
+    logger.error("Gave up on %s after %d retries (all 429)", url[-80:], retries)
+    return None
+
+
+# ── Top institutional investors with known EDGAR CIKs ────────────────────────
+# CIKs verified against SEC EDGAR company search.
+# Each entry: (display_name, integer_cik)
 TOP_INSTITUTIONS = [
-    "VANGUARD GROUP",
-    "BLACKROCK",
-    "STATE STREET",
-    "FIDELITY MANAGEMENT",
-    "T ROWE PRICE",
-    "JPMORGAN CHASE",
-    "GOLDMAN SACHS",
-    "MORGAN STANLEY",
-    "INVESCO",
-    "GEODE CAPITAL",
-    "NORTHERN TRUST",
-    "WELLINGTON MANAGEMENT",
-    "CAPITAL RESEARCH",
-    "CITADEL ADVISORS",
-    "MILLENNIUM MANAGEMENT",
-    "RENAISSANCE TECHNOLOGIES",
-    "TWO SIGMA",
-    "AQR CAPITAL",
-    "COATUE MANAGEMENT",
-    "TIGER GLOBAL",
-    "POINT72",
-    "DE SHAW",
-    "BRIDGEWATER",
-    "BALYASNY",
-    "VIKING GLOBAL",
+    ("Vanguard Group",            102909),
+    ("BlackRock",                 1364742),
+    ("State Street",              93751),
+    ("Fidelity (FMR LLC)",        315066),
+    ("T. Rowe Price",             80255),
+    ("JPMorgan Chase",            19617),
+    ("Goldman Sachs",             886982),
+    ("Morgan Stanley",            895421),
+    ("Invesco",                   914208),
+    ("Northern Trust",            73124),
+    ("Wellington Management",     107263),
+    ("Geode Capital Management",  1444822),
+    ("Capital Research Global",   315966),
+    ("Charles Schwab",            316206),
+    ("Citadel Advisors",          1423298),
+    ("Millennium Management",     1273931),
+    ("Renaissance Technologies",  1037389),
+    ("Two Sigma Investments",     1536411),
+    ("D.E. Shaw",                 1009207),
+    ("AQR Capital Management",   1280790),
+    ("Coatue Management",         1336528),
+    ("Tiger Global Management",   1167483),
+    ("Viking Global Investors",   1103804),
+    ("Balyasny Asset Management", 1283699),
+    ("Point72 Asset Management",  1603466),
 ]
 
 # Ticker → fragment of company name as it appears in 13F nameOfIssuer field.
-# Used to match holdings back to our universe tickers.
 TICKER_NAME_MAP = {
     "NVDA": "NVIDIA",              "AMD":   "ADVANCED MICRO DEVICES",
     "INTC": "INTEL CORP",          "AVGO":  "BROADCOM",
@@ -168,19 +158,18 @@ TICKER_NAME_MAP = {
     "STRL": "STERLING INFRA",      "FLNC":  "FLUENCE ENERGY",
     "GFS":  "GLOBALFOUNDRIES",     "APLD":  "APPLIED DIGITAL",
     "VICR": "VICOR CORP",          "ORA":   "ORMAT",
-    "LITE": "LUMENTUM",            "ENPH":  "ENPHASE ENERGY",
-    "FSLR": "FIRST SOLAR",         "NEE":   "NEXTERA ENERGY",
-    "CEG":  "CONSTELLATION ENERGY","VST":   "VISTRA",
-    "NRG":  "NRG ENERGY",          "PLUG":  "PLUG POWER",
-    "RUN":  "SUNRUN",              "MP":    "MP MATERIALS",
-    "RKLB": "ROCKET LAB",          "ASTS":  "AST SPACEMOBILE",
-    "LUNR": "INTUITIVE MACHINES",  "BKSY":  "BLACKSKY",
-    "PL":   "PLANET LABS",         "SPCE":  "VIRGIN GALACTIC",
-    "RDW":  "REDWIRE",             "S":     "SENTINELONE",
-    "OKTA": "OKTA",                "ZS":    "ZSCALER",
-    "NET":  "CLOUDFLARE",          "FTNT":  "FORTINET",
-    "CYBR": "CYBERARK",            "TENB":  "TENABLE",
-    "QLYS": "QUALYS",              "NVDA":  "NVIDIA",
+    "LITE": "LUMENTUM",            "FSLR":  "FIRST SOLAR",
+    "NEE":  "NEXTERA ENERGY",      "CEG":   "CONSTELLATION ENERGY",
+    "VST":  "VISTRA",              "NRG":   "NRG ENERGY",
+    "PLUG": "PLUG POWER",          "RUN":   "SUNRUN",
+    "MP":   "MP MATERIALS",        "RKLB":  "ROCKET LAB",
+    "ASTS": "AST SPACEMOBILE",     "LUNR":  "INTUITIVE MACHINES",
+    "BKSY": "BLACKSKY",            "PL":    "PLANET LABS",
+    "SPCE": "VIRGIN GALACTIC",     "RDW":   "REDWIRE",
+    "S":    "SENTINELONE",         "OKTA":  "OKTA",
+    "ZS":   "ZSCALER",             "NET":   "CLOUDFLARE",
+    "FTNT": "FORTINET",            "CYBR":  "CYBERARK",
+    "TENB": "TENABLE",             "QLYS":  "QUALYS",
     "WMT":  "WALMART",             "COST":  "COSTCO",
     "NFLX": "NETFLIX",             "AMGN":  "AMGEN",
     "SHOP": "SHOPIFY",             "TMUS":  "T-MOBILE",
@@ -188,136 +177,133 @@ TICKER_NAME_MAP = {
     "BKNG": "BOOKING HOLDINGS",   "ISRG":  "INTUITIVE SURGICAL",
     "VRTX": "VERTEX PHARMA",       "SBUX":  "STARBUCKS",
     "ADBE": "ADOBE",               "ADP":   "AUTOMATIC DATA",
-    "INTU": "INTUIT",              "CSX":   "CSX CORP",
-    "MAR":  "MARRIOTT",            "CMCSA": "COMCAST",
-    "DDOG": "DATADOG",             "ROST":  "ROSS STORES",
-    "CTAS": "CINTAS",              "REGN":  "REGENERON",
-    "HON":  "HONEYWELL",           "ORLY":  "O REILLY AUTO",
-    "PCAR": "PACCAR",              "AEP":   "AMERICAN ELECTRIC",
-    "FAST": "FASTENAL",            "FANG":  "DIAMONDBACK",
-    "ADSK": "AUTODESK",            "PYPL":  "PAYPAL",
-    "XEL":  "XCEL ENERGY",         "EXC":   "EXELON",
-    "IDXX": "IDEXX LAB",           "AXON":  "AXON ENTERPRISE",
-    "TTWO": "TAKE TWO",            "ODFL":  "OLD DOMINION",
-    "WDAY": "WORKDAY",             "PAYX":  "PAYCHEX",
-    "KDP":  "KEURIG DR PEPPER",    "ROP":   "ROPER TECH",
-    "GEHC": "GE HEALTHCARE",       "DXCM":  "DEXCOM",
-    "ALNY": "ALNYLAM",             "CPRT":  "COPART",
+    "INTU": "INTUIT",              "DDOG":  "DATADOG",
+    "ENPH": "ENPHASE ENERGY",      "CCJ":   "CAMECO",
+    "SMR":  "NUSCALE POWER",       "NNE":   "NANO NUCLEAR",
+    "OKLO": "OKLO INC",            "WULF":  "TERAWULF",
+    "UUUU": "ENERGY FUELS",        "DNN":   "DENISON MINES",
+    "IDR":  "IDAHO STRATEGIC",     "TMC":   "TMC THE METALS",
     "MTSI": "MACOM TECH",          "ASX":   "ASE TECH",
     "UMC":  "UNITED MICRO",        "SWKS":  "SKYWORKS",
     "WOLF": "WOLFSPEED",           "ACLS":  "AXCELIS",
     "CRUS": "CIRRUS LOGIC",        "STX":   "SEAGATE",
-    "FORM": "FORMFACTOR",
+    "FORM": "FORMFACTOR",          "CLS":   "CELESTICA",
 }
 
-# In-memory cache for institution 13F XML — downloaded once per backfill run,
+# In-memory XML cache — downloaded once per institution per backfill run,
 # reused across multiple universe scans.
 _xml_cache: dict[str, str | None] = {}
 
 
-# ── EDGAR helpers ─────────────────────────────────────────────────────────────
+# ── EDGAR submissions-API helpers ─────────────────────────────────────────────
 
-def _find_institution_13f(institution_name: str, start_date: str) -> dict | None:
-    """
-    Find the most recent 13F-HR filing for an institution by searching EDGAR
-    EFTS for filings where the entity_name matches the institution name.
+def _padded_cik(cik: int) -> str:
+    return str(cik).zfill(10)
 
-    Returns a dict with cik, accession, filer, filed_date, period or None.
+
+def _get_latest_13f(cik: int, start_date: str) -> dict | None:
     """
-    params = {
-        "q":         f'"{institution_name}"',
-        "forms":     "13F-HR",
-        "dateRange": "custom",
-        "startdt":   start_date,
-        "from":      0,
-        "size":      5,
-    }
-    try:
-        resp = requests.get(EFTS_URL, params=params, headers=HEADERS, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
-        logger.warning("EFTS search error for %s: %s", institution_name, exc)
+    Fetch the institution's filing history via the EDGAR submissions API and
+    return the most recent 13F-HR (or 13F-HR/A) filed on or after start_date.
+
+    Returns {"accession": "...", "filed_date": "...", "period": "..."} or None.
+    """
+    url = f"{SUBMISSIONS_BASE}/CIK{_padded_cik(cik)}.json"
+    resp = _sec_get(url, timeout=15)
+    if not resp or not resp.ok:
+        logger.debug("Submissions fetch failed for CIK %d: %s", cik, resp.status_code if resp else "no resp")
         return None
 
-    hits = (data.get("hits") or {}).get("hits") or []
-    name_parts = institution_name.upper().split()
+    try:
+        data = resp.json()
+    except Exception as exc:
+        logger.debug("JSON parse error for CIK %d: %s", cik, exc)
+        return None
 
-    for hit in hits:
-        src         = hit.get("_source") or {}
-        entity_name = (src.get("entity_name") or "").upper()
-        # Confirm this hit is actually the institution filing (not a mention)
-        if not any(part in entity_name for part in name_parts[:2]):
+    filer_name = data.get("name", f"CIK {cik}")
+    recent     = (data.get("filings") or {}).get("recent") or {}
+    forms       = recent.get("form",            [])
+    dates       = recent.get("filingDate",      [])
+    accessions  = recent.get("accessionNumber", [])
+    periods     = recent.get("reportDate",      [])
+
+    for form, date, acc, period in zip(forms, dates, accessions, periods):
+        if form not in ("13F-HR", "13F-HR/A"):
             continue
-
-        accession = (hit.get("_id") or "").replace(":", "-")
-        acc_clean = accession.replace("-", "")
-        cik       = str(int(acc_clean[:10]))   # strip leading zeros
-
+        if date < start_date:
+            break   # results are newest-first; once past cutoff we're done
         return {
+            "filer":      filer_name,
+            "accession":  acc,
+            "filed_date": date,
+            "period":     _format_period(period or date),
             "cik":        cik,
-            "accession":  accession,
-            "filer":      src.get("entity_name") or institution_name,
-            "filed_date": src.get("file_date") or "—",
-            "period":     _format_period(src.get("period_of_report") or ""),
         }
+
     return None
 
 
-def _get_info_table_xml(cik: str, accession: str) -> str | None:
+def _get_info_table_xml(cik: int, accession: str) -> str | None:
     """
     Download the 13F information table XML for a filing.
-    Fetches the filing index to find the info table file URL.
-    Results are cached in _xml_cache to avoid redundant downloads.
+    Uses the filing index to locate the correct XML file.
+    Results cached in _xml_cache to avoid re-downloading across universe scans.
     """
-    if accession in _xml_cache:
-        return _xml_cache[accession]
+    cache_key = accession
+    if cache_key in _xml_cache:
+        return _xml_cache[cache_key]
 
     result = None
+    acc_nodash = accession.replace("-", "")
+
     try:
-        index_url = f"{EDGAR_BASE}/Archives/edgar/data/{cik}/{accession}-index.htm"
-        resp = requests.get(index_url, headers={**HEADERS, "Accept": "text/html"}, timeout=12)
-        if not resp.ok:
-            _xml_cache[accession] = None
+        # Fetch the filing's index page to find the info table file
+        index_url = f"{EDGAR_BASE}/Archives/edgar/data/{cik}/{acc_nodash}/{accession}-index.htm"
+        idx = _sec_get(index_url, extra_headers={"Accept": "text/html"}, timeout=12)
+        if not idx or not idx.ok:
+            logger.warning("  Filing index not found: %s (CIK %d)", accession, cik)
+            _xml_cache[cache_key] = None
             return None
 
-        # Find the information table XML link
-        # Prioritise files with "infotable" or "information" in the name
+        # Find XML links in the index — prefer files with "info" or "table" in name
         xml_links = re.findall(
             r'href="(/Archives/edgar/data/[^"]+\.xml)"',
-            resp.text, re.IGNORECASE
+            idx.text, re.IGNORECASE
         )
         if not xml_links:
-            _xml_cache[accession] = None
+            logger.warning("  No XML files in filing index for %s", accession)
+            _xml_cache[cache_key] = None
             return None
 
-        # Prefer the info table file over the primary submission wrapper
         preferred = [l for l in xml_links if re.search(r'info|table|holding', l, re.IGNORECASE)]
         link = preferred[0] if preferred else xml_links[-1]
+        logger.info("  Info table file: %s", link.split("/")[-1])
 
-        xml_resp = requests.get(
+        xml_resp = _sec_get(
             EDGAR_BASE + link,
-            headers={**HEADERS, "Accept": "application/xml,text/xml"},
-            timeout=30,
+            extra_headers={"Accept": "application/xml,text/xml"},
+            timeout=45,
         )
-        result = xml_resp.text if xml_resp.ok else None
+        if xml_resp and xml_resp.ok and len(xml_resp.text) > 500:
+            result = xml_resp.text
+            logger.info("  Downloaded %d bytes of XML", len(result))
+        else:
+            logger.warning("  XML download failed or empty for %s", accession)
 
     except Exception as exc:
         logger.debug("get_info_table_xml error (%s): %s", accession, exc)
 
-    _xml_cache[accession] = result
+    _xml_cache[cache_key] = result
     return result
 
 
 def _parse_holdings(xml_text: str, universe_tickers: set) -> list[dict]:
     """
-    Parse a 13F information table XML and return holdings that match
-    tickers in universe_tickers.
-
-    Matching is done by company name fragment (TICKER_NAME_MAP) since
-    13F XML uses nameOfIssuer, not ticker symbols.
+    Parse 13F information table XML and return holdings matching universe_tickers.
+    Matches by company name fragment (TICKER_NAME_MAP) since 13F uses nameOfIssuer,
+    not ticker symbols.
     """
-    # Build lookup: name fragment → ticker (only for tickers we care about)
+    # Build lookup: name fragment (upper) → ticker
     name_to_ticker: dict[str, str] = {}
     for ticker in universe_tickers:
         frag = TICKER_NAME_MAP.get(ticker.upper())
@@ -341,7 +327,7 @@ def _parse_holdings(xml_text: str, universe_tickers: set) -> list[dict]:
         if not matched_ticker:
             continue
 
-        # Skip options (put/call entries)
+        # Skip options
         if re.search(r'<putCall>\s*(?:put|call)\s*</putCall>', block, re.IGNORECASE):
             continue
 
@@ -376,31 +362,27 @@ def scan_tickers(tickers: list, days: int = 270, enrich: bool = True) -> list[di
     Find which top institutional investors hold the given tickers, based on
     their most recent 13F-HR quarterly filings.
 
-    For each of TOP_INSTITUTIONS:
-      1. Find their most recent 13F-HR filing via EDGAR EFTS
-      2. Download and parse the information table XML (cached across calls)
-      3. Match holdings to tickers in the provided list
-
-    Returns list of {ticker, filer, shares, value_k, period, filed_date}.
+    Uses EDGAR submissions API (same approach as insider scanner's Form 4 fetch)
+    — no EFTS full-text search, which does not index 13F holdings content.
     """
-    start_date   = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
-    ticker_set   = {t.upper() for t in tickers}
-    all_results  = []
+    start_date  = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    ticker_set  = {t.upper() for t in tickers}
+    all_results = []
 
-    for inst_name in TOP_INSTITUTIONS:
-        logger.info("Checking %s for %d tickers...", inst_name, len(ticker_set))
-        filing = _find_institution_13f(inst_name, start_date)
+    for display_name, cik in TOP_INSTITUTIONS:
+        logger.info("Checking %s (CIK %d) for %d tickers...", display_name, cik, len(ticker_set))
+
+        filing = _get_latest_13f(cik, start_date)
         if not filing:
-            logger.info("  No 13F found for %s in lookback window", inst_name)
-            time.sleep(0.5)
+            logger.info("  No 13F-HR found within lookback window")
             continue
 
-        logger.info("  Found: %s (filed %s, %s)", filing["filer"], filing["filed_date"], filing["period"])
+        logger.info("  Found: %s  filed %s  (%s)",
+                    filing["filer"], filing["filed_date"], filing["period"])
 
-        xml = _get_info_table_xml(filing["cik"], filing["accession"])
+        xml = _get_info_table_xml(cik, filing["accession"])
         if not xml:
-            logger.warning("  Could not retrieve info table XML for %s", filing["filer"])
-            time.sleep(0.5)
+            logger.warning("  Could not retrieve info table XML — skipping")
             continue
 
         holdings = _parse_holdings(xml, ticker_set)
@@ -418,8 +400,8 @@ def scan_tickers(tickers: list, days: int = 270, enrich: bool = True) -> list[di
                 "accession":  filing["accession"],
             })
 
-        time.sleep(1.0)   # be polite to SEC EDGAR
+        time.sleep(0.5)   # additional courtesy pause between institutions
 
-    logger.info("scan_tickers complete: %d results across %d institutions",
+    logger.info("scan_tickers complete: %d results across %d institutions checked",
                 len(all_results), len(TOP_INSTITUTIONS))
     return all_results
