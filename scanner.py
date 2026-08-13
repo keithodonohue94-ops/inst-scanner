@@ -389,17 +389,27 @@ def scan_tickers(tickers: list, days: int = 270, enrich: bool = True) -> list[di
         holdings = _parse_holdings(xml, ticker_set)
         logger.info("  Matched %d holdings from universe", len(holdings))
 
+        # Aggregate across sub-entities (same ticker may appear multiple times
+        # in a single 13F when the filer has multiple fund entities)
+        agg: dict[str, dict] = {}
         for h in holdings:
-            all_results.append({
-                "ticker":     h["ticker"],
-                "filer":      filing["filer"],
-                "form":       "13F-HR",
-                "filed_date": filing["filed_date"],
-                "period":     filing["period"],
-                "shares":     h["shares"],
-                "value_k":    h["value_k"],
-                "accession":  filing["accession"],
-            })
+            key = h["ticker"]
+            if key in agg:
+                agg[key]["shares"]  = (agg[key]["shares"]  or 0) + (h["shares"]  or 0)
+                agg[key]["value_k"] = (agg[key]["value_k"] or 0) + (h["value_k"] or 0)
+            else:
+                agg[key] = {
+                    "ticker":     h["ticker"],
+                    "filer":      filing["filer"],
+                    "form":       "13F-HR",
+                    "filed_date": filing["filed_date"],
+                    "period":     filing["period"],
+                    "shares":     h["shares"] or 0,
+                    "value_k":    h["value_k"] or 0,
+                    "accession":  filing["accession"],
+                }
+        for row in agg.values():
+            all_results.append(row)
 
         time.sleep(0.5)   # additional courtesy pause between institutions
 
