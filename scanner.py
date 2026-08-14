@@ -20,6 +20,8 @@ import logging
 import requests
 from datetime import datetime, timedelta, timezone
 
+import db
+
 logger = logging.getLogger(__name__)
 
 # ── Universe definitions (fallback — overridden by DB-synced universes) ───────
@@ -408,6 +410,72 @@ def scan_tickers(tickers: list, days: int = 270, enrich: bool = True) -> list[di
                     "value_k":    h["value_k"] or 0,
                     "accession":  filing["accession"],
                 }
+
+        # ── Change signal: compare current holdings vs last stored snapshot ──
+        prior = db.get_prior_holdings(cik)
+
+        for ticker_key, row in agg.items():
+            prev = prior.get(ticker_key)
+            curr_shares = row.get("shares") or 0
+
+            if prev is None:
+                # Never tracked this institution+ticker before
+                row["change"]       = "Initiated"
+                row["prev_shares"]  = None
+                row["prev_period"]  = None
+                row["shares_delta"] = None
+            elif prev.get("period") == filing["period"]:
+                # Same quarterly filing — no change to report
+                row["change"]       = "Unchanged"
+                row["prev_shares"]  = prev["shares"]
+                row["prev_period"]  = prev["period"]
+                row["shares_delta"] = 0
+            else:
+                prev_shares = prev.get("shares") or 0
+                delta = curr_shares - prev_shares
+                if delta > 0:
+                    row["change"] = "Added"
+                elif delta < 0:
+                    row["change"] = "Reduced"
+                else:
+                    row["change"] = "Unchanged"
+                row["prev_shares"]  = prev_shares
+                row["prev_period"]  = prev.get("period")
+                row["shares_delta"] = delta
+
+        # Detect exits: tickers held last period but absent from current filing
+        for ticker_key, prev in prior.items():
+            if ticker_key in ticker_set and ticker_key not in agg:
+                if prev.get("period") and prev.get("period") != filing["period"]:
+                    all_results.append({
+                        "ticker":       ticker_key,
+                        "filer":        filing["filer"],
+                        "form":         "13F-HR",
+                        "filed_date":   filing["filed_date"],
+                        "period":       filing["period"],
+                        "shares":       0,
+                        "value_k":      0,
+                        "accession":    filing["accession"],
+                        "change":       "Exited",
+                        "prev_shares":  prev.get("shares"),
+                        "prev_period":  prev.get("period"),
+                        "shares_delta": -(prev.get("shares") or 0),
+                    })
+
+        # Persist current holdings for future comparison
+        now_str = datetime.now(timezone.utc).isoformat()
+        holdings_to_store = [
+            {
+                "ticker":     row["ticker"],
+                "shares":     row.get("shares"),
+                "value_k":    row.get("value_k"),
+                "period":     filing["period"],
+                "filed_date": filing["filed_date"],
+            }
+            for row in agg.values()
+        ]
+        db.upsert_holdings(cik, holdings_to_store, now_str)
+
         for row in agg.values():
             all_results.append(row)
 

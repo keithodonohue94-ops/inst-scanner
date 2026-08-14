@@ -28,7 +28,7 @@ def _conn():
 
 
 def init_db():
-    """Create inst_scan_cache and inst_custom_universes tables if they don't exist."""
+    """Create inst_scan_cache, inst_custom_universes, and inst_holdings tables if they don't exist."""
     if not _USE_PG:
         return
     try:
@@ -53,10 +53,22 @@ def init_db():
                 updated_at TEXT NOT NULL
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS inst_holdings (
+                institution_cik INTEGER NOT NULL,
+                ticker          TEXT    NOT NULL,
+                shares          BIGINT,
+                value_k         BIGINT,
+                period          TEXT,
+                filed_date      TEXT,
+                updated_at      TEXT,
+                PRIMARY KEY (institution_cik, ticker)
+            )
+        """)
         conn.commit()
         cur.close()
         conn.close()
-        logger.info("inst_scan_cache + inst_custom_universes tables ready")
+        logger.info("inst_scan_cache + inst_custom_universes + inst_holdings tables ready")
     except Exception as e:
         logger.error("init_db failed: %s", e)
 
@@ -169,6 +181,78 @@ def load_scan(universe: str, days: int) -> dict | None:
     except Exception as e:
         logger.error("load_scan failed (%s/%dd): %s", universe, days, e)
         return None
+
+
+def get_prior_holdings(institution_cik: int) -> dict:
+    """
+    Load last known holdings for an institution.
+    Returns dict: ticker -> {shares, value_k, period, filed_date}
+    """
+    if not _USE_PG:
+        return {}
+    try:
+        conn = _conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute(
+            "SELECT ticker, shares, value_k, period, filed_date FROM inst_holdings WHERE institution_cik = %s",
+            (institution_cik,)
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return {
+            r["ticker"]: {
+                "shares":     r["shares"],
+                "value_k":    r["value_k"],
+                "period":     r["period"],
+                "filed_date": r["filed_date"],
+            }
+            for r in rows
+        }
+    except Exception as e:
+        logger.error("get_prior_holdings failed (CIK %d): %s", institution_cik, e)
+        return {}
+
+
+def upsert_holdings(institution_cik: int, holdings: list, updated_at: str):
+    """
+    Upsert current holdings snapshot for an institution.
+    holdings = [{ticker, shares, value_k, period, filed_date}]
+    Only updates if the period is newer than what's stored.
+    """
+    if not _USE_PG:
+        return
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        for h in holdings:
+            cur.execute("""
+                INSERT INTO inst_holdings
+                    (institution_cik, ticker, shares, value_k, period, filed_date, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (institution_cik, ticker) DO UPDATE SET
+                    shares     = EXCLUDED.shares,
+                    value_k    = EXCLUDED.value_k,
+                    period     = EXCLUDED.period,
+                    filed_date = EXCLUDED.filed_date,
+                    updated_at = EXCLUDED.updated_at
+                WHERE inst_holdings.period IS NULL
+                   OR EXCLUDED.filed_date > inst_holdings.filed_date
+            """, (
+                institution_cik,
+                h["ticker"],
+                h.get("shares"),
+                h.get("value_k"),
+                h.get("period"),
+                h.get("filed_date"),
+                updated_at,
+            ))
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("Upserted %d holdings for CIK %d", len(holdings), institution_cik)
+    except Exception as e:
+        logger.error("upsert_holdings failed (CIK %d): %s", institution_cik, e)
 
 
 def load_all_cached() -> dict:
