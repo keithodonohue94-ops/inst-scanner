@@ -204,46 +204,47 @@ def _padded_cik(cik: int) -> str:
     return str(cik).zfill(10)
 
 
-def _get_latest_13f(cik: int, start_date: str) -> dict | None:
+def _get_recent_13fs(cik: int, start_date: str, max_filings: int = 2) -> list[dict]:
     """
-    Fetch the institution's filing history via the EDGAR submissions API and
-    return the most recent 13F-HR (or 13F-HR/A) filed on or after start_date.
-
-    Returns {"accession": "...", "filed_date": "...", "period": "..."} or None.
+    Fetch up to max_filings most recent 13F-HR (or 13F-HR/A) within the lookback window.
+    Returns a list newest-first; may return fewer if fewer exist in the window.
     """
     url = f"{SUBMISSIONS_BASE}/CIK{_padded_cik(cik)}.json"
     resp = _sec_get(url, timeout=15)
     if not resp or not resp.ok:
         logger.debug("Submissions fetch failed for CIK %d: %s", cik, resp.status_code if resp else "no resp")
-        return None
+        return []
 
     try:
         data = resp.json()
     except Exception as exc:
         logger.debug("JSON parse error for CIK %d: %s", cik, exc)
-        return None
+        return []
 
     filer_name = data.get("name", f"CIK {cik}")
     recent     = (data.get("filings") or {}).get("recent") or {}
-    forms       = recent.get("form",            [])
-    dates       = recent.get("filingDate",      [])
-    accessions  = recent.get("accessionNumber", [])
-    periods     = recent.get("reportDate",      [])
+    forms      = recent.get("form",            [])
+    dates      = recent.get("filingDate",      [])
+    accessions = recent.get("accessionNumber", [])
+    periods    = recent.get("reportDate",      [])
 
+    results = []
     for form, date, acc, period in zip(forms, dates, accessions, periods):
         if form not in ("13F-HR", "13F-HR/A"):
             continue
         if date < start_date:
-            break   # results are newest-first; once past cutoff we're done
-        return {
+            break   # filing history is newest-first; past the window now
+        results.append({
             "filer":      filer_name,
             "accession":  acc,
             "filed_date": date,
             "period":     _format_period(period or date),
             "cik":        cik,
-        }
+        })
+        if len(results) >= max_filings:
+            break
 
-    return None
+    return results
 
 
 def _get_info_table_xml(cik: int, accession: str) -> str | None:
@@ -375,13 +376,19 @@ def scan_tickers(tickers: list, days: int = 270, enrich: bool = True) -> list[di
     for display_name, cik in TOP_INSTITUTIONS:
         logger.info("Checking %s (CIK %d) for %d tickers...", display_name, cik, len(ticker_set))
 
-        filing = _get_latest_13f(cik, start_date)
-        if not filing:
+        filings = _get_recent_13fs(cik, start_date, max_filings=2)
+        if not filings:
             logger.info("  No 13F-HR found within lookback window")
             continue
 
-        logger.info("  Found: %s  filed %s  (%s)",
+        filing       = filings[0]                          # current (most recent)
+        prior_filing = filings[1] if len(filings) > 1 else None
+
+        logger.info("  Current: %s  filed %s  (%s)",
                     filing["filer"], filing["filed_date"], filing["period"])
+        if prior_filing:
+            logger.info("  Prior:   filed %s  (%s)",
+                        prior_filing["filed_date"], prior_filing["period"])
 
         xml = _get_info_table_xml(cik, filing["accession"])
         if not xml:
@@ -390,6 +397,24 @@ def scan_tickers(tickers: list, days: int = 270, enrich: bool = True) -> list[di
 
         holdings = _parse_holdings(xml, ticker_set)
         logger.info("  Matched %d holdings from universe", len(holdings))
+
+        # ── Fetch and parse the prior filing for direct Q1→Q2 comparison ──
+        prior_from_filing: dict[str, dict] = {}
+        if prior_filing and prior_filing["period"] != filing["period"]:
+            prior_xml = _get_info_table_xml(cik, prior_filing["accession"])
+            if prior_xml:
+                for h in _parse_holdings(prior_xml, ticker_set):
+                    key = h["ticker"]
+                    if key in prior_from_filing:
+                        prior_from_filing[key]["shares"]  += h["shares"]  or 0
+                        prior_from_filing[key]["value_k"] += h["value_k"] or 0
+                    else:
+                        prior_from_filing[key] = {
+                            "shares":  h["shares"]  or 0,
+                            "value_k": h["value_k"] or 0,
+                        }
+                logger.info("  Prior filing: %d matched holdings (%s)",
+                            len(prior_from_filing), prior_filing["period"])
 
         # Aggregate across sub-entities (same ticker may appear multiple times
         # in a single 13F when the filer has multiple fund entities)
@@ -411,8 +436,35 @@ def scan_tickers(tickers: list, days: int = 270, enrich: bool = True) -> list[di
                     "accession":  filing["accession"],
                 }
 
-        # ── Change signal: compare current holdings vs last stored snapshot ──
-        prior = db.get_prior_holdings(cik)
+        # ── Change signal: prefer live Q1 filing; fall back to DB snapshot ──
+        if prior_from_filing:
+            # Direct filing comparison — seed DB with prior data if empty
+            existing_db = db.get_prior_holdings(cik)
+            if not existing_db:
+                to_seed = [
+                    {
+                        "ticker":     t,
+                        "shares":     d["shares"],
+                        "value_k":    d["value_k"],
+                        "period":     prior_filing["period"],
+                        "filed_date": prior_filing["filed_date"],
+                    }
+                    for t, d in prior_from_filing.items()
+                ]
+                db.upsert_holdings(cik, to_seed, datetime.now(timezone.utc).isoformat())
+                logger.info("  Seeded %d prior holdings (CIK %d / %s)",
+                            len(to_seed), cik, prior_filing["period"])
+            prior = {
+                t: {
+                    "shares":     d["shares"],
+                    "value_k":    d["value_k"],
+                    "period":     prior_filing["period"],
+                    "filed_date": prior_filing["filed_date"],
+                }
+                for t, d in prior_from_filing.items()
+            }
+        else:
+            prior = db.get_prior_holdings(cik)
 
         for ticker_key, row in agg.items():
             prev = prior.get(ticker_key)
