@@ -395,6 +395,21 @@ def trigger_backfill():
     })
 
 
+@app.route("/api/scan-all", methods=["POST"])
+def trigger_scan_all():
+    """
+    Trigger a fresh scan across all universes in background.
+    Results are persisted to DB as each universe completes.
+    """
+    t = threading.Thread(target=_daily_fetch, daemon=True)
+    t.start()
+    return jsonify({
+        "status":    "started",
+        "universes": list(UNIVERSES.keys()),
+        "message":   f"Scanning {len(UNIVERSES)} universes in background",
+    })
+
+
 @app.route("/api/backfill-prior", methods=["POST"])
 def trigger_backfill_prior():
     """
