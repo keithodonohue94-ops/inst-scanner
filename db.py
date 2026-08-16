@@ -214,6 +214,47 @@ def get_prior_holdings(institution_cik: int) -> dict:
         return {}
 
 
+def seed_prior_holdings(institution_cik: int, holdings: list, updated_at: str):
+    """
+    Force-seed prior-quarter holdings as the baseline for change detection.
+    Unconditional upsert — no filed_date guard — so it always resets the
+    reference point regardless of what is already stored.
+    Use this for the 'Backfill Prior Quarter' operation only.
+    holdings = [{ticker, shares, value_k, period, filed_date}]
+    """
+    if not _USE_PG:
+        return
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        for h in holdings:
+            cur.execute("""
+                INSERT INTO inst_holdings
+                    (institution_cik, ticker, shares, value_k, period, filed_date, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (institution_cik, ticker) DO UPDATE SET
+                    shares     = EXCLUDED.shares,
+                    value_k    = EXCLUDED.value_k,
+                    period     = EXCLUDED.period,
+                    filed_date = EXCLUDED.filed_date,
+                    updated_at = EXCLUDED.updated_at
+            """, (
+                institution_cik,
+                h["ticker"],
+                h.get("shares"),
+                h.get("value_k"),
+                h.get("period"),
+                h.get("filed_date"),
+                updated_at,
+            ))
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("Seeded %d prior holdings for CIK %d", len(holdings), institution_cik)
+    except Exception as e:
+        logger.error("seed_prior_holdings failed (CIK %d): %s", institution_cik, e)
+
+
 def upsert_holdings(institution_cik: int, holdings: list, updated_at: str):
     """
     Upsert current holdings snapshot for an institution.

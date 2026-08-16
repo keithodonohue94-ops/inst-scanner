@@ -23,7 +23,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from scanner import scan_tickers, UNIVERSES as _BASE_UNIVERSES
+from scanner import scan_tickers, backfill_prior_holdings, UNIVERSES as _BASE_UNIVERSES
 import db
 
 # Mutable universe registry — starts from scanner.py defaults, then
@@ -390,6 +390,35 @@ def trigger_backfill():
         "message":   f"90-day backfill running for all universes: {list(UNIVERSES.keys())}",
         "universes": list(UNIVERSES.keys()),
         "days":      BACKFILL_DAYS,
+    })
+
+
+@app.route("/api/backfill-prior", methods=["POST"])
+def trigger_backfill_prior():
+    """
+    Seed inst_holdings with the second-most-recent 13F per institution across
+    all universes. This establishes the prior-quarter baseline so the next scan
+    can derive Initiated / Added / Reduced / Exited signals correctly.
+
+    Uses seed_prior_holdings (unconditional upsert) — always resets the baseline
+    regardless of what is currently stored.
+    """
+    # Collect all unique tickers across every universe
+    all_tickers = list({t for tickers in UNIVERSES.values() for t in tickers})
+
+    def _run():
+        logger.info("=== Prior-quarter backfill starting (%d unique tickers) ===",
+                    len(all_tickers))
+        result = backfill_prior_holdings(all_tickers, days=BACKFILL_DAYS)
+        logger.info("=== Prior-quarter backfill complete: %s ===", result)
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return jsonify({
+        "status":       "started",
+        "message":      "Backfilling prior-quarter holdings for all universes",
+        "total_tickers": len(all_tickers),
+        "universes":    list(UNIVERSES.keys()),
     })
 
 

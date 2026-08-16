@@ -364,10 +364,12 @@ def _format_period(period_raw: str) -> str:
 def scan_tickers(tickers: list, days: int = 270, enrich: bool = True) -> list[dict]:
     """
     Find which top institutional investors hold the given tickers, based on
-    their most recent 13F-HR quarterly filings.
+    their most recent 13F-HR quarterly filing.
 
-    Uses EDGAR submissions API (same approach as insider scanner's Form 4 fetch)
-    — no EFTS full-text search, which does not index 13F holdings content.
+    Compares the current filing against the prior-quarter baseline stored in
+    inst_holdings (seeded via backfill_prior_holdings). After comparison,
+    overwrites inst_holdings with the current quarter so it becomes the
+    reference point for the next quarter's scan.
     """
     start_date  = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
     ticker_set  = {t.upper() for t in tickers}
@@ -376,19 +378,14 @@ def scan_tickers(tickers: list, days: int = 270, enrich: bool = True) -> list[di
     for display_name, cik in TOP_INSTITUTIONS:
         logger.info("Checking %s (CIK %d) for %d tickers...", display_name, cik, len(ticker_set))
 
-        filings = _get_recent_13fs(cik, start_date, max_filings=2)
+        filings = _get_recent_13fs(cik, start_date, max_filings=1)
         if not filings:
             logger.info("  No 13F-HR found within lookback window")
             continue
 
-        filing       = filings[0]                          # current (most recent)
-        prior_filing = filings[1] if len(filings) > 1 else None
-
-        logger.info("  Current: %s  filed %s  (%s)",
+        filing = filings[0]
+        logger.info("  Filing: %s  filed %s  (%s)",
                     filing["filer"], filing["filed_date"], filing["period"])
-        if prior_filing:
-            logger.info("  Prior:   filed %s  (%s)",
-                        prior_filing["filed_date"], prior_filing["period"])
 
         xml = _get_info_table_xml(cik, filing["accession"])
         if not xml:
@@ -398,26 +395,8 @@ def scan_tickers(tickers: list, days: int = 270, enrich: bool = True) -> list[di
         holdings = _parse_holdings(xml, ticker_set)
         logger.info("  Matched %d holdings from universe", len(holdings))
 
-        # ── Fetch and parse the prior filing for direct Q1→Q2 comparison ──
-        prior_from_filing: dict[str, dict] = {}
-        if prior_filing and prior_filing["period"] != filing["period"]:
-            prior_xml = _get_info_table_xml(cik, prior_filing["accession"])
-            if prior_xml:
-                for h in _parse_holdings(prior_xml, ticker_set):
-                    key = h["ticker"]
-                    if key in prior_from_filing:
-                        prior_from_filing[key]["shares"]  += h["shares"]  or 0
-                        prior_from_filing[key]["value_k"] += h["value_k"] or 0
-                    else:
-                        prior_from_filing[key] = {
-                            "shares":  h["shares"]  or 0,
-                            "value_k": h["value_k"] or 0,
-                        }
-                logger.info("  Prior filing: %d matched holdings (%s)",
-                            len(prior_from_filing), prior_filing["period"])
-
-        # Aggregate across sub-entities (same ticker may appear multiple times
-        # in a single 13F when the filer has multiple fund entities)
+        # ── Aggregate across sub-entities ────────────────────────────────────
+        # Same ticker can appear multiple times when a filer has multiple funds
         agg: dict[str, dict] = {}
         for h in holdings:
             key = h["ticker"]
@@ -436,52 +415,21 @@ def scan_tickers(tickers: list, days: int = 270, enrich: bool = True) -> list[di
                     "accession":  filing["accession"],
                 }
 
-        # ── Change signal: prefer live Q1 filing; fall back to DB snapshot ──
-        if prior_from_filing:
-            # Direct filing comparison — seed DB with prior data if empty
-            existing_db = db.get_prior_holdings(cik)
-            if not existing_db:
-                to_seed = [
-                    {
-                        "ticker":     t,
-                        "shares":     d["shares"],
-                        "value_k":    d["value_k"],
-                        "period":     prior_filing["period"],
-                        "filed_date": prior_filing["filed_date"],
-                    }
-                    for t, d in prior_from_filing.items()
-                ]
-                db.upsert_holdings(cik, to_seed, datetime.now(timezone.utc).isoformat())
-                logger.info("  Seeded %d prior holdings (CIK %d / %s)",
-                            len(to_seed), cik, prior_filing["period"])
-            prior = {
-                t: {
-                    "shares":     d["shares"],
-                    "value_k":    d["value_k"],
-                    "period":     prior_filing["period"],
-                    "filed_date": prior_filing["filed_date"],
-                }
-                for t, d in prior_from_filing.items()
-            }
-        else:
-            prior = db.get_prior_holdings(cik)
+        # ── Change signal: compare current filing to prior-quarter DB baseline ──
+        db_prior = db.get_prior_holdings(cik)
+        # Ignore same-period entries — avoids comparing a quarter to itself if
+        # backfill hasn't been run yet or the scan is re-run within the same quarter
+        prior = {t: v for t, v in db_prior.items() if v.get("period") != filing["period"]}
 
         for ticker_key, row in agg.items():
             prev = prior.get(ticker_key)
             curr_shares = row.get("shares") or 0
 
             if prev is None:
-                # Never tracked this institution+ticker before
                 row["change"]       = "Initiated"
                 row["prev_shares"]  = None
                 row["prev_period"]  = None
                 row["shares_delta"] = None
-            elif prev.get("period") == filing["period"]:
-                # Same quarterly filing — no change to report
-                row["change"]       = "Unchanged"
-                row["prev_shares"]  = prev["shares"]
-                row["prev_period"]  = prev["period"]
-                row["shares_delta"] = 0
             else:
                 prev_shares = prev.get("shares") or 0
                 delta = curr_shares - prev_shares
@@ -495,26 +443,25 @@ def scan_tickers(tickers: list, days: int = 270, enrich: bool = True) -> list[di
                 row["prev_period"]  = prev.get("period")
                 row["shares_delta"] = delta
 
-        # Detect exits: tickers held last period but absent from current filing
+        # ── Detect exits: in prior but absent from current filing ─────────────
         for ticker_key, prev in prior.items():
             if ticker_key in ticker_set and ticker_key not in agg:
-                if prev.get("period") and prev.get("period") != filing["period"]:
-                    all_results.append({
-                        "ticker":       ticker_key,
-                        "filer":        filing["filer"],
-                        "form":         "13F-HR",
-                        "filed_date":   filing["filed_date"],
-                        "period":       filing["period"],
-                        "shares":       0,
-                        "value_k":      0,
-                        "accession":    filing["accession"],
-                        "change":       "Exited",
-                        "prev_shares":  prev.get("shares"),
-                        "prev_period":  prev.get("period"),
-                        "shares_delta": -(prev.get("shares") or 0),
-                    })
+                all_results.append({
+                    "ticker":       ticker_key,
+                    "filer":        filing["filer"],
+                    "form":         "13F-HR",
+                    "filed_date":   filing["filed_date"],
+                    "period":       filing["period"],
+                    "shares":       0,
+                    "value_k":      0,
+                    "accession":    filing["accession"],
+                    "change":       "Exited",
+                    "prev_shares":  prev.get("shares"),
+                    "prev_period":  prev.get("period"),
+                    "shares_delta": -(prev.get("shares") or 0),
+                })
 
-        # Persist current holdings for future comparison
+        # ── Persist current holdings — becomes the baseline for next quarter ──
         now_str = datetime.now(timezone.utc).isoformat()
         holdings_to_store = [
             {
@@ -531,8 +478,88 @@ def scan_tickers(tickers: list, days: int = 270, enrich: bool = True) -> list[di
         for row in agg.values():
             all_results.append(row)
 
-        time.sleep(0.5)   # additional courtesy pause between institutions
+        time.sleep(0.5)
 
     logger.info("scan_tickers complete: %d results across %d institutions checked",
                 len(all_results), len(TOP_INSTITUTIONS))
     return all_results
+
+
+def backfill_prior_holdings(tickers: list, days: int = 270) -> dict:
+    """
+    Seed inst_holdings with the second-most-recent 13F per institution.
+    This establishes the prior-quarter baseline so that the next scan can
+    derive meaningful change signals (Initiated / Added / Reduced / Exited).
+
+    Quarter-agnostic: always uses filing[1] relative to the most recent filing,
+    so it works correctly regardless of which quarter we are currently in.
+    Uses seed_prior_holdings (unconditional upsert) to force-reset the baseline
+    even if a scan has already run and stored the current quarter.
+    """
+    start_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    ticker_set = {t.upper() for t in tickers}
+    seeded = 0
+    skipped = 0
+
+    for display_name, cik in TOP_INSTITUTIONS:
+        logger.info("Backfill prior: %s (CIK %d)", display_name, cik)
+
+        filings = _get_recent_13fs(cik, start_date, max_filings=2)
+        if len(filings) < 2:
+            logger.info("  Only %d filing(s) in window — skipping", len(filings))
+            skipped += 1
+            continue
+
+        prior_filing = filings[1]   # second most recent = prior quarter
+        current_filing = filings[0]
+
+        if prior_filing["period"] == current_filing["period"]:
+            logger.info("  Prior and current have same period (%s) — skipping",
+                        prior_filing["period"])
+            skipped += 1
+            continue
+
+        logger.info("  Prior quarter: %s  filed %s",
+                    prior_filing["period"], prior_filing["filed_date"])
+
+        xml = _get_info_table_xml(cik, prior_filing["accession"])
+        if not xml:
+            logger.warning("  Could not retrieve prior XML — skipping")
+            skipped += 1
+            continue
+
+        holdings = _parse_holdings(xml, ticker_set)
+        if not holdings:
+            logger.info("  No universe tickers found in prior filing — skipping")
+            skipped += 1
+            continue
+
+        # Aggregate sub-entities
+        agg: dict[str, dict] = {}
+        for h in holdings:
+            key = h["ticker"]
+            if key in agg:
+                agg[key]["shares"]  = (agg[key]["shares"]  or 0) + (h["shares"]  or 0)
+                agg[key]["value_k"] = (agg[key]["value_k"] or 0) + (h["value_k"] or 0)
+            else:
+                agg[key] = {"shares": h["shares"] or 0, "value_k": h["value_k"] or 0}
+
+        to_seed = [
+            {
+                "ticker":     ticker,
+                "shares":     d["shares"],
+                "value_k":    d["value_k"],
+                "period":     prior_filing["period"],
+                "filed_date": prior_filing["filed_date"],
+            }
+            for ticker, d in agg.items()
+        ]
+
+        db.seed_prior_holdings(cik, to_seed, datetime.now(timezone.utc).isoformat())
+        logger.info("  Seeded %d prior holdings (%s)", len(to_seed), prior_filing["period"])
+        seeded += len(to_seed)
+        time.sleep(0.5)
+
+    logger.info("backfill_prior_holdings complete: %d holdings seeded, %d institutions skipped",
+                seeded, skipped)
+    return {"seeded": seeded, "skipped": skipped}
