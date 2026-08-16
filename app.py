@@ -72,6 +72,7 @@ def check_auth():
 CACHE: dict = {}
 SCANNING: set = set()
 _cache_lock = threading.Lock()
+_PRIOR_BACKFILL_RUNNING = False
 
 DEFAULT_DAYS = 270
 BACKFILL_DAYS = 270         # 270 days covers three full quarters of 13F filings
@@ -191,11 +192,12 @@ def stats():
         max(cached, key=lambda x: x["scanned_at"]) if cached else None
     )
     return jsonify({
-        "status":    "ok",
-        "last_scan": last_scan,
-        "cached":    cached,
-        "scanning":  [{"universe": k[0], "days": k[1]} for k in SCANNING],
-        "universes": list(UNIVERSES.keys()),
+        "status":                 "ok",
+        "last_scan":              last_scan,
+        "cached":                 cached,
+        "scanning":               [{"universe": k[0], "days": k[1]} for k in SCANNING],
+        "universes":              list(UNIVERSES.keys()),
+        "prior_backfill_running": _PRIOR_BACKFILL_RUNNING,
     })
 
 
@@ -407,10 +409,15 @@ def trigger_backfill_prior():
     all_tickers = list({t for tickers in UNIVERSES.values() for t in tickers})
 
     def _run():
+        global _PRIOR_BACKFILL_RUNNING
+        _PRIOR_BACKFILL_RUNNING = True
         logger.info("=== Prior-quarter backfill starting (%d unique tickers) ===",
                     len(all_tickers))
-        result = backfill_prior_holdings(all_tickers, days=BACKFILL_DAYS)
-        logger.info("=== Prior-quarter backfill complete: %s ===", result)
+        try:
+            result = backfill_prior_holdings(all_tickers, days=BACKFILL_DAYS)
+            logger.info("=== Prior-quarter backfill complete: %s ===", result)
+        finally:
+            _PRIOR_BACKFILL_RUNNING = False
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
