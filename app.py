@@ -63,15 +63,8 @@ def check_auth():
             return jsonify({"error": "Unauthorized"}), 401
     return None
 
-# ── In-memory cache ───────────────────────────────────────────────────────────
-# Structure:  CACHE[(universe_key, days_int)] = {
-#   "results":    [...],
-#   "scanned_at": "2026-07-28T02:00:00Z",
-#   "count":      42,
-# }
-CACHE: dict = {}
-SCANNING: set = set()
-_cache_lock = threading.Lock()
+# ── Scan state ────────────────────────────────────────────────────────────────
+SCANNING: set = set()          # keys currently being scanned; prevents duplicates
 _PRIOR_BACKFILL_RUNNING = False
 
 DEFAULT_DAYS = 270
@@ -88,7 +81,7 @@ def _cache_key(universe: str, days: int) -> tuple:
 
 
 def _run_scan(universe_key: str, days: int):
-    """Fetch EDGAR filings for one universe/window, update cache, persist to DB."""
+    """Fetch EDGAR filings for one universe/window and persist to DB."""
     key = _cache_key(universe_key, days)
     if key in SCANNING:
         logger.info("Already scanning %s/%dd — skipping", universe_key, days)
@@ -106,16 +99,6 @@ def _run_scan(universe_key: str, days: int):
     try:
         results = scan_tickers(tickers, days=days, enrich=True)
         now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-        entry = {
-            "results":    results,
-            "scanned_at": now,
-            "count":      len(results),
-            "universe":   universe_key,
-            "days":       days,
-        }
-        with _cache_lock:
-            CACHE[key] = entry
-        # Persist to PostgreSQL so results survive redeploys
         db.save_scan(universe_key, days, now, results)
         logger.info("Done: %s/%dd — %d filings", universe_key, days, len(results))
     except Exception as exc:
@@ -172,29 +155,17 @@ def health():
         "status":    "ok",
         "timestamp": _now(),
         "db":        {"connected": db_ok, "cached_rows": db_rows},
-        "cache":     len(CACHE),
     })
 
 
 @app.route("/api/stats")
 def stats():
-    with _cache_lock:
-        cached = [
-            {
-                "universe":   k[0],
-                "days":       k[1],
-                "count":      v["count"],
-                "scanned_at": v["scanned_at"],
-            }
-            for k, v in CACHE.items()
-        ]
-    last_scan = (
-        max(cached, key=lambda x: x["scanned_at"]) if cached else None
-    )
+    scan_stats = db.load_scan_stats()
+    last_scan = scan_stats[0] if scan_stats else None   # already sorted DESC by scanned_at
     return jsonify({
         "status":                 "ok",
         "last_scan":              last_scan,
-        "cached":                 cached,
+        "cached":                 scan_stats,
         "scanning":               [{"universe": k[0], "days": k[1]} for k in SCANNING],
         "universes":              list(UNIVERSES.keys()),
         "prior_backfill_running": _PRIOR_BACKFILL_RUNNING,
@@ -253,16 +224,7 @@ def poll():
     days     = int(request.args.get("days", DEFAULT_DAYS))
     key      = _cache_key(universe, days)
 
-    with _cache_lock:
-        data = CACHE.get(key)
-
-    # Cache miss — check DB (scan may have completed on a different worker)
-    if not data:
-        data = db.load_scan(universe, days)
-        if data:
-            with _cache_lock:
-                CACHE[key] = data
-
+    data     = db.load_scan(universe, days)
     scanning = key in SCANNING
     if data:
         return jsonify({
@@ -377,6 +339,54 @@ def test_institution():
         "xml_preview": xml_preview,
         "matched_holdings": holdings,
     })
+
+
+@app.route("/api/db-check")
+def db_check():
+    """
+    Diagnostic: inspect inst_holdings baseline table.
+    Optional ?ticker=CRDO to filter by ticker.
+    Returns period distribution + sample rows.
+    """
+    ticker = request.args.get("ticker", "").upper() or None
+    if not db._USE_PG:
+        return jsonify({"error": "No DB connected"})
+    try:
+        import psycopg2.extras
+        conn = db._conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+        # Period distribution
+        cur.execute("SELECT period, COUNT(*) as cnt FROM inst_holdings GROUP BY period ORDER BY period")
+        periods = [{"period": r["period"], "count": r["cnt"]} for r in cur.fetchall()]
+
+        # Total rows
+        cur.execute("SELECT COUNT(*) FROM inst_holdings")
+        total = cur.fetchone()[0]
+
+        # Sample rows (filtered by ticker if provided)
+        if ticker:
+            cur.execute("""
+                SELECT institution_cik, ticker, shares, value_k, period, filed_date, updated_at
+                FROM inst_holdings WHERE ticker = %s ORDER BY institution_cik LIMIT 50
+            """, (ticker,))
+        else:
+            cur.execute("""
+                SELECT institution_cik, ticker, shares, value_k, period, filed_date, updated_at
+                FROM inst_holdings ORDER BY updated_at DESC LIMIT 50
+            """)
+        rows = [dict(r) for r in cur.fetchall()]
+
+        cur.close()
+        conn.close()
+        return jsonify({
+            "total_rows":        total,
+            "period_distribution": periods,
+            "sample_rows":       rows,
+            "filter_ticker":     ticker,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/backfill", methods=["POST"])

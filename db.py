@@ -296,6 +296,27 @@ def upsert_holdings(institution_cik: int, holdings: list, updated_at: str):
         logger.error("upsert_holdings failed (CIK %d): %s", institution_cik, e)
 
 
+def load_scan_stats() -> list:
+    """
+    Lightweight metadata query — returns scanned_at / count per universe/days
+    without loading the full results JSON blob.
+    Returns list of {universe, days, scanned_at, count}.
+    """
+    if not _USE_PG:
+        return []
+    try:
+        conn = _conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+        cur.execute("SELECT universe, days, scanned_at, count FROM inst_scan_cache ORDER BY scanned_at DESC")
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return [{"universe": r["universe"], "days": r["days"], "scanned_at": r["scanned_at"], "count": r["count"]} for r in rows]
+    except Exception as e:
+        logger.error("load_scan_stats failed: %s", e)
+        return []
+
+
 def load_all_cached() -> dict:
     """
     Load all persisted scan results from DB.
