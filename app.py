@@ -53,7 +53,7 @@ _VALID_TOKEN = _make_token(_OSPREY_PASSWORD)
 def check_auth():
     if request.method == "OPTIONS":
         return None
-    if request.path in ("/api/health", "/api/db-check", "/api/reset-baseline"):
+    if request.path in ("/api/health", "/api/db-check", "/api/reset-baseline", "/api/verify-ciks", "/api/test-institution"):
         return None
     if request.path.startswith("/api/"):
         auth = request.headers.get("Authorization", "")
