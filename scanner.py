@@ -191,6 +191,8 @@ TICKER_NAME_MAP = {
     "WOLF": "WOLFSPEED",           "ACLS":  "AXCELIS",
     "CRUS": "CIRRUS LOGIC",        "STX":   "SEAGATE",
     "FORM": "FORMFACTOR",          "CLS":   "CELESTICA",
+    "STM":  "STMICROELECTRONICS",  "ETR":   "ENTERGY",
+    "USAR": "US RARE EARTHS",
 }
 
 # In-memory XML cache — downloaded once per institution per backfill run,
