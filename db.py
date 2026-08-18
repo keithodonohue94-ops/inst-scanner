@@ -214,6 +214,26 @@ def get_prior_holdings(institution_cik: int) -> dict:
         return {}
 
 
+def clear_holdings_baseline():
+    """
+    Wipe the entire inst_holdings table before a fresh backfill.
+    Called at the start of every Backfill Prior Quarter run so we never
+    layer new baseline data on top of stale rows from a prior quarter.
+    """
+    if not _USE_PG:
+        return
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM inst_holdings")
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("inst_holdings baseline cleared")
+    except Exception as e:
+        logger.error("clear_holdings_baseline failed: %s", e)
+
+
 def seed_prior_holdings(institution_cik: int, holdings: list, updated_at: str):
     """
     Force-seed prior-quarter holdings as the baseline for change detection.

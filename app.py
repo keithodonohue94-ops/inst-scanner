@@ -468,6 +468,10 @@ def trigger_backfill_prior():
         logger.info("=== Prior-quarter backfill starting (%d unique tickers) ===",
                     len(all_tickers))
         try:
+            # Always clear the entire baseline first so we never layer on top
+            # of stale data from a previous quarter or a bad scan write.
+            db.clear_holdings_baseline()
+            logger.info("=== Baseline cleared — seeding prior quarter ===")
             result = backfill_prior_holdings(all_tickers, days=BACKFILL_DAYS)
             logger.info("=== Prior-quarter backfill complete: %s ===", result)
         finally:
