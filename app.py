@@ -53,7 +53,7 @@ _VALID_TOKEN = _make_token(_OSPREY_PASSWORD)
 def check_auth():
     if request.method == "OPTIONS":
         return None
-    if request.path in ("/api/health", "/api/db-check"):
+    if request.path in ("/api/health", "/api/db-check", "/api/reset-baseline"):
         return None
     if request.path.startswith("/api/"):
         auth = request.headers.get("Authorization", "")
@@ -385,6 +385,35 @@ def db_check():
             "sample_rows":       rows,
             "filter_ticker":     ticker,
         })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/reset-baseline", methods=["POST"])
+def reset_baseline():
+    """
+    Delete all inst_holdings rows that are NOT from the backfill quarter.
+    Pass ?keep_period=Q4+2025 (or whatever the backfill quarter is).
+    This cleans up rows incorrectly written by a scan run.
+    """
+    keep = request.args.get("keep_period", "").strip()
+    if not keep:
+        return jsonify({"error": "Must supply ?keep_period=Q4+2025"}), 400
+    if not db._USE_PG:
+        return jsonify({"error": "No DB"}), 500
+    try:
+        import psycopg2
+        conn = db._conn()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM inst_holdings WHERE period != %s", (keep,))
+        to_delete = cur.fetchone()[0]
+        cur.execute("DELETE FROM inst_holdings WHERE period != %s", (keep,))
+        conn.commit()
+        cur.execute("SELECT COUNT(*) FROM inst_holdings")
+        remaining = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+        return jsonify({"deleted": to_delete, "remaining": remaining, "kept_period": keep})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 

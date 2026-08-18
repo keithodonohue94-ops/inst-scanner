@@ -473,7 +473,11 @@ def scan_tickers(tickers: list, days: int = 270, enrich: bool = True) -> list[di
             }
             for row in agg.values()
         ]
-        db.upsert_holdings(cik, holdings_to_store, now_str)
+        # NOTE: do NOT write back to inst_holdings here.
+        # inst_holdings is the prior-quarter baseline managed exclusively by
+        # backfill_prior_holdings(). Writing current-quarter data here would
+        # overwrite the baseline and cause every subsequent scan to show
+        # INITIATED for all positions.
 
         for row in agg.values():
             all_results.append(row)
