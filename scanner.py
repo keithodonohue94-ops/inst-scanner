@@ -117,21 +117,21 @@ TOP_INSTITUTIONS = [
     ("Morgan Stanley",            895421),
     ("Invesco",                   914208),
     ("Northern Trust",            73124),
-    ("Wellington Management",     107263),
-    ("Geode Capital Management",  1444822),
-    ("Capital Research Global",   315966),
-    ("Charles Schwab",            316206),
-    ("Citadel Advisors",          1423298),
-    ("Millennium Management",     1273931),
+    ("Wellington Management",     902219),    # fixed: was 107263 (Williams Companies)
+    ("Geode Capital Management",  1214717),   # fixed: was 1444822 (AQR Funds)
+    ("Capital Research Global",   1422848),   # fixed: was 315966 (null entity)
+    ("Charles Schwab",            884546),    # fixed: was 316206 (Starwood Hotels); files as SCHWAB CHARLES INVESTMENT MANAGEMENT INC
+    ("Citadel Advisors",          1423053),   # fixed: was 1423298 (DFJ Athena Partners)
+    ("Millennium Management",     1273931),   # TODO: verify — may file confidentially or under holding co
     ("Renaissance Technologies",  1037389),
     ("Duquesne Family Office",     1536411),   # Druckenmiller — CIK confirmed
-    ("Two Sigma Investments",     1447362),   # Two Sigma Investments LP
-    ("D.E. Shaw",                 1009207),
-    ("AQR Capital Management",   1280790),
-    ("Coatue Management",         1336528),
+    ("Two Sigma Investments",     1179392),   # fixed: was 1447362 (Castle Biosciences)
+    ("D.E. Shaw",                 1009207),    # match:false but entity is "D. E. Shaw & Co., Inc." — correct
+    ("AQR Capital Management",   1167557),    # fixed: was 1280790 (Adams David)
+    ("Coatue Management",         1135730),   # fixed: was 1336528 (Pershing Square)
     ("Tiger Global Management",   1167483),
     ("Viking Global Investors",   1103804),
-    ("Balyasny Asset Management", 1283699),
+    ("Balyasny Asset Management", 2054122),   # fixed: was 1283699 (T-Mobile); files as Longaeva Partners L.P.
     ("Point72 Asset Management",  1603466),
 ]
 
