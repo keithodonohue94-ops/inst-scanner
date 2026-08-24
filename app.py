@@ -249,6 +249,14 @@ def get_universes():
     })
 
 
+@app.route("/api/universes/<key>", methods=["DELETE"])
+def delete_universe(key):
+    """Delete a custom universe by key from DB and live UNIVERSES dict."""
+    UNIVERSES.pop(key, None)
+    db.delete_custom_universe(key)
+    return jsonify({"deleted": key})
+
+
 @app.route("/api/universes/sync", methods=["POST"])
 def sync_universes():
     """

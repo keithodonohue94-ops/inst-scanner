@@ -132,6 +132,22 @@ def load_custom_universes() -> list:
         return []
 
 
+def delete_custom_universe(key: str):
+    """Delete a single custom universe by key."""
+    if not _USE_PG:
+        return
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM inst_custom_universes WHERE key = %s", (key,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("Deleted universe: %s", key)
+    except Exception as e:
+        logger.error("delete_custom_universe failed: %s", e)
+
+
 def save_scan(universe: str, days: int, scanned_at: str, results: list):
     """Upsert scan results for a universe/days combination."""
     if not _USE_PG:
