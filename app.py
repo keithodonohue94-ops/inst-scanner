@@ -237,6 +237,18 @@ def poll():
     return jsonify({"ready": False, "scanning": scanning})
 
 
+@app.route("/api/universes", methods=["GET"])
+def get_universes():
+    """Return all custom universes persisted in DB."""
+    custom = db.load_custom_universes()
+    return jsonify({
+        "universes": [
+            {"key": u["key"], "name": u["name"], "tickers": u["tickers"]}
+            for u in custom
+        ]
+    })
+
+
 @app.route("/api/universes/sync", methods=["POST"])
 def sync_universes():
     """
