@@ -45,16 +45,73 @@ def init_db():
                 UNIQUE(universe, days)
             )
         """)
+        # Create universes table with auto-increment id as primary key.
+        # If the old schema (key TEXT PRIMARY KEY) exists, migrate it.
+        cur.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'inst_custom_universes' AND column_name = 'id'
+                ) THEN
+                    -- Migrate old schema to id-anchored schema
+                    CREATE TABLE inst_custom_universes_v2 (
+                        id         SERIAL PRIMARY KEY,
+                        key        TEXT UNIQUE NOT NULL,
+                        name       TEXT NOT NULL,
+                        tickers    TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'inst_custom_universes') THEN
+                        INSERT INTO inst_custom_universes_v2 (key, name, tickers, created_at, updated_at)
+                        SELECT key, name, tickers, updated_at, updated_at FROM inst_custom_universes;
+                        DROP TABLE inst_custom_universes;
+                    END IF;
+                    ALTER TABLE inst_custom_universes_v2 RENAME TO inst_custom_universes;
+                END IF;
+            END $$;
+        """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS inst_custom_universes (
-                key      TEXT PRIMARY KEY,
-                name     TEXT NOT NULL,
-                tickers  TEXT NOT NULL,
+                id         SERIAL PRIMARY KEY,
+                key        TEXT UNIQUE NOT NULL,
+                name       TEXT NOT NULL,
+                tickers    TEXT NOT NULL,
+                created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
         """)
         cur.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'inst_holdings' AND column_name = 'id'
+                ) THEN
+                    CREATE TABLE inst_holdings_v2 (
+                        id              SERIAL PRIMARY KEY,
+                        institution_cik INTEGER NOT NULL,
+                        ticker          TEXT    NOT NULL,
+                        shares          BIGINT,
+                        value_k         BIGINT,
+                        period          TEXT,
+                        filed_date      TEXT,
+                        updated_at      TEXT,
+                        UNIQUE (institution_cik, ticker)
+                    );
+                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'inst_holdings') THEN
+                        INSERT INTO inst_holdings_v2 (institution_cik, ticker, shares, value_k, period, filed_date, updated_at)
+                        SELECT institution_cik, ticker, shares, value_k, period, filed_date, updated_at FROM inst_holdings;
+                        DROP TABLE inst_holdings;
+                    END IF;
+                    ALTER TABLE inst_holdings_v2 RENAME TO inst_holdings;
+                END IF;
+            END $$;
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS inst_holdings (
+                id              SERIAL PRIMARY KEY,
                 institution_cik INTEGER NOT NULL,
                 ticker          TEXT    NOT NULL,
                 shares          BIGINT,
@@ -62,7 +119,7 @@ def init_db():
                 period          TEXT,
                 filed_date      TEXT,
                 updated_at      TEXT,
-                PRIMARY KEY (institution_cik, ticker)
+                UNIQUE (institution_cik, ticker)
             )
         """)
         conn.commit()
@@ -73,58 +130,18 @@ def init_db():
         logger.error("init_db failed: %s", e)
 
 
-def save_custom_universes(universes: list):
-    """
-    Full replace of custom universe definitions.
-    Universes NOT in the incoming list are deleted; the rest are upserted.
-    universes = [{key, name, tickers}]
-    """
-    if not _USE_PG:
-        return
-    try:
-        from datetime import datetime, timezone
-        now = datetime.now(timezone.utc).isoformat()
-        incoming_keys = [u["key"] for u in universes]
-        conn = _conn()
-        cur = conn.cursor()
-        # Delete universes no longer in the frontend list
-        if incoming_keys:
-            cur.execute(
-                "DELETE FROM inst_custom_universes WHERE key != ALL(%s)",
-                (incoming_keys,)
-            )
-        else:
-            cur.execute("DELETE FROM inst_custom_universes")
-        # Upsert the current set
-        for u in universes:
-            cur.execute("""
-                INSERT INTO inst_custom_universes (key, name, tickers, updated_at)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (key) DO UPDATE SET
-                    name       = EXCLUDED.name,
-                    tickers    = EXCLUDED.tickers,
-                    updated_at = EXCLUDED.updated_at
-            """, (u["key"], u["name"], json.dumps(u["tickers"]), now))
-        conn.commit()
-        cur.close()
-        conn.close()
-        logger.info("Universe sync: %d universes active in DB", len(universes))
-    except Exception as e:
-        logger.error("save_custom_universes failed: %s", e)
-
-
 def load_custom_universes() -> list:
-    """Load custom universe definitions from DB. Returns [{key, name, tickers}]"""
+    """Load all custom universe definitions. Returns [{id, key, name, tickers}]"""
     if not _USE_PG:
         return []
     try:
         conn = _conn()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute("SELECT key, name, tickers FROM inst_custom_universes ORDER BY key")
+        cur.execute("SELECT id, key, name, tickers FROM inst_custom_universes ORDER BY id")
         rows = cur.fetchall()
         cur.close()
         conn.close()
-        result = [{"key": r["key"], "name": r["name"], "tickers": json.loads(r["tickers"])} for r in rows]
+        result = [{"id": r["id"], "key": r["key"], "name": r["name"], "tickers": json.loads(r["tickers"])} for r in rows]
         logger.info("Loaded %d custom universes from DB", len(result))
         return result
     except Exception as e:
@@ -132,18 +149,64 @@ def load_custom_universes() -> list:
         return []
 
 
-def delete_custom_universe(key: str):
-    """Delete a single custom universe by key."""
+def create_custom_universe(key: str, name: str, tickers: list) -> int:
+    """Insert a new universe and return its auto-assigned id."""
+    if not _USE_PG:
+        return 0
+    try:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO inst_custom_universes (key, name, tickers, created_at, updated_at) "
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (key, name, json.dumps(tickers), now, now)
+        )
+        new_id = cur.fetchone()[0]
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("Created universe id=%d key=%s", new_id, key)
+        return new_id
+    except Exception as e:
+        logger.error("create_custom_universe failed: %s", e)
+        return 0
+
+
+def update_custom_universe(universe_id: int, name: str, tickers: list):
+    """Update name and tickers for universe with given id."""
+    if not _USE_PG:
+        return
+    try:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).isoformat()
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE inst_custom_universes SET name=%s, tickers=%s, updated_at=%s WHERE id=%s",
+            (name, json.dumps(tickers), now, universe_id)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("Updated universe id=%d", universe_id)
+    except Exception as e:
+        logger.error("update_custom_universe failed: %s", e)
+
+
+def delete_custom_universe(universe_id: int):
+    """Delete universe by its integer id."""
     if not _USE_PG:
         return
     try:
         conn = _conn()
         cur = conn.cursor()
-        cur.execute("DELETE FROM inst_custom_universes WHERE key = %s", (key,))
+        cur.execute("DELETE FROM inst_custom_universes WHERE id = %s", (universe_id,))
         conn.commit()
         cur.close()
         conn.close()
-        logger.info("Deleted universe: %s", key)
+        logger.info("Deleted universe id=%d", universe_id)
     except Exception as e:
         logger.error("delete_custom_universe failed: %s", e)
 
