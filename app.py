@@ -239,66 +239,75 @@ def poll():
 
 @app.route("/api/universes", methods=["GET"])
 def get_universes():
-    """Return all custom universes persisted in DB."""
+    """Return all custom universes from DB, each with its stable integer id."""
     custom = db.load_custom_universes()
     return jsonify({
         "universes": [
-            {"key": u["key"], "name": u["name"], "tickers": u["tickers"]}
+            {"id": u["id"], "key": u["key"], "name": u["name"], "tickers": u["tickers"]}
             for u in custom
         ]
     })
 
 
-@app.route("/api/universes/<key>", methods=["DELETE"])
-def delete_universe(key):
-    """Delete a custom universe by key from DB and live UNIVERSES dict."""
-    UNIVERSES.pop(key, None)
-    db.delete_custom_universe(key)
-    return jsonify({"deleted": key})
+@app.route("/api/universes", methods=["POST"])
+def create_universe():
+    """Create a new custom universe. Returns {id, key, name}."""
+    body    = request.get_json(silent=True) or {}
+    key     = body.get("key", "").strip()
+    name    = body.get("name", "").strip()
+    tickers = body.get("tickers", [])
+    if not key or not name:
+        return jsonify({"error": "key and name required"}), 400
+    new_id = db.create_custom_universe(key, name, tickers)
+    UNIVERSES[key] = tickers
+    logger.info("Created universe id=%d key=%s", new_id, key)
+    return jsonify({"id": new_id, "key": key, "name": name}), 201
 
 
-@app.route("/api/universes/sync", methods=["POST"])
-def sync_universes():
-    """
-    Receive universe definitions from the frontend and persist them to DB.
-    Body: [{"key": "aiinfra", "name": "AI Infrastructure", "tickers": ["NVDA", ...]}]
-    Merges into the live UNIVERSES dict so the daily fetch picks them up.
-    """
-    universes = request.get_json(silent=True)
-    if not isinstance(universes, list):
-        return jsonify({"error": "Expected a JSON array of universe objects"}), 400
+@app.route("/api/universes/by-key/<key>", methods=["PUT"])
+def upsert_universe_by_key(key):
+    """Upsert a universe by key — creates if missing, updates if exists. Returns {id, key}."""
+    body    = request.get_json(silent=True) or {}
+    name    = body.get("name", key).strip()
+    tickers = body.get("tickers", [])
+    existing = next((u for u in db.load_custom_universes() if u["key"] == key), None)
+    if existing:
+        db.update_custom_universe(existing["id"], name, tickers)
+        UNIVERSES[key] = tickers
+        return jsonify({"id": existing["id"], "key": key, "upserted": "updated"})
+    else:
+        new_id = db.create_custom_universe(key, name, tickers)
+        UNIVERSES[key] = tickers
+        return jsonify({"id": new_id, "key": key, "upserted": "created"})
 
-    valid = []
-    for u in universes:
-        key     = u.get("key", "").strip()
-        name    = u.get("name", "").strip()
-        tickers = u.get("tickers", [])
-        if not key or not name or not isinstance(tickers, list) or not tickers:
-            continue
-        valid.append({"key": key, "name": name, "tickers": tickers})
 
-    if not valid:
-        return jsonify({"error": "No valid universe objects found"}), 400
+@app.route("/api/universes/<int:universe_id>", methods=["PUT"])
+def update_universe(universe_id):
+    """Update tickers (and optionally name) for a universe by its id."""
+    body    = request.get_json(silent=True) or {}
+    name    = body.get("name", "").strip()
+    tickers = body.get("tickers")
+    if not name or tickers is None:
+        return jsonify({"error": "name and tickers required"}), 400
+    db.update_custom_universe(universe_id, name, tickers)
+    # Keep live UNIVERSES dict in sync (find key by scanning current universes)
+    for u in db.load_custom_universes():
+        if u["id"] == universe_id:
+            UNIVERSES[u["key"]] = tickers
+            break
+    return jsonify({"updated": universe_id})
 
-    # Full replace of custom universes in live UNIVERSES dict:
-    # 1. Remove any keys that were previously synced but aren't in this payload
-    incoming_keys = {u["key"] for u in valid}
-    stale = [k for k in list(UNIVERSES.keys()) if k not in incoming_keys and k not in _BASE_UNIVERSES]
-    for k in stale:
-        UNIVERSES.pop(k, None)
-    # 2. Upsert the incoming set
-    for u in valid:
-        UNIVERSES[u["key"]] = u["tickers"]
 
-    # Persist to DB (full replace — deletes stale rows too)
-    db.save_custom_universes(valid)
-
-    logger.info("Synced %d universes from frontend. Total UNIVERSES: %d", len(valid), len(UNIVERSES))
-    return jsonify({
-        "status":   "ok",
-        "synced":   len(valid),
-        "universes": list(UNIVERSES.keys()),
-    })
+@app.route("/api/universes/<int:universe_id>", methods=["DELETE"])
+def delete_universe(universe_id):
+    """Delete a custom universe by its integer id."""
+    # Find the key before deleting so we can clean up UNIVERSES dict
+    for u in db.load_custom_universes():
+        if u["id"] == universe_id:
+            UNIVERSES.pop(u["key"], None)
+            break
+    db.delete_custom_universe(universe_id)
+    return jsonify({"deleted": universe_id})
 
 
 @app.route("/api/verify-ciks")
