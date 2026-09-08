@@ -107,7 +107,9 @@ def _sec_get(url: str, params: dict = None, extra_headers: dict = None,
 # CIKs verified against SEC EDGAR company search.
 # Each entry: (display_name, integer_cik)
 TOP_INSTITUTIONS = [
-    ("Vanguard Group",            102909),
+    ("Vanguard Group",            102909),    # parent entity — stopped filing after Q4 2025
+    ("Vanguard Portfolio Mgmt",   2100121),  # new sub-entity, filing from Q1 2026 (CIK 0002100121)
+    ("Vanguard Capital Mgmt",     2100119),  # new sub-entity, filing from Q1 2026 (CIK 0002100119)
     ("BlackRock",                 1364742),
     ("State Street",              93751),
     ("Fidelity (FMR LLC)",        315066),

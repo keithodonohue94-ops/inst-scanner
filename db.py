@@ -45,41 +45,15 @@ def init_db():
                 UNIQUE(universe, days)
             )
         """)
-        # Create universes table with auto-increment id as primary key.
-        # If the old schema (key TEXT PRIMARY KEY) exists, migrate it.
+        # universes table is owned by insider-scanner (shared DB).
+        # inst-scanner reads/writes it directly — no separate inst_custom_universes needed.
         cur.execute("""
-            DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name = 'inst_custom_universes' AND column_name = 'id'
-                ) THEN
-                    -- Migrate old schema to id-anchored schema
-                    CREATE TABLE inst_custom_universes_v2 (
-                        id         SERIAL PRIMARY KEY,
-                        key        TEXT UNIQUE NOT NULL,
-                        name       TEXT NOT NULL,
-                        tickers    TEXT NOT NULL,
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT NOT NULL
-                    );
-                    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'inst_custom_universes') THEN
-                        INSERT INTO inst_custom_universes_v2 (key, name, tickers, created_at, updated_at)
-                        SELECT key, name, tickers, updated_at, updated_at FROM inst_custom_universes;
-                        DROP TABLE inst_custom_universes;
-                    END IF;
-                    ALTER TABLE inst_custom_universes_v2 RENAME TO inst_custom_universes;
-                END IF;
-            END $$;
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS inst_custom_universes (
-                id         SERIAL PRIMARY KEY,
-                key        TEXT UNIQUE NOT NULL,
-                name       TEXT NOT NULL,
-                tickers    TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+            CREATE TABLE IF NOT EXISTS universes (
+                id       SERIAL PRIMARY KEY,
+                key      TEXT UNIQUE NOT NULL,
+                name     TEXT NOT NULL,
+                tickers  TEXT NOT NULL DEFAULT '[]',
+                is_index INTEGER NOT NULL DEFAULT 0
             )
         """)
         cur.execute("""
@@ -125,7 +99,7 @@ def init_db():
         conn.commit()
         cur.close()
         conn.close()
-        logger.info("inst_scan_cache + inst_custom_universes + inst_holdings tables ready")
+        logger.info("inst_scan_cache + universes (shared) + inst_holdings tables ready")
     except Exception as e:
         logger.error("init_db failed: %s", e)
 
@@ -137,7 +111,7 @@ def load_custom_universes() -> list:
     try:
         conn = _conn()
         cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
-        cur.execute("SELECT id, key, name, tickers FROM inst_custom_universes ORDER BY id")
+        cur.execute("SELECT id, key, name, tickers FROM universes WHERE is_index = 0 ORDER BY id")
         rows = cur.fetchall()
         cur.close()
         conn.close()
@@ -159,9 +133,10 @@ def create_custom_universe(key: str, name: str, tickers: list) -> int:
         conn = _conn()
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO inst_custom_universes (key, name, tickers, created_at, updated_at) "
-            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
-            (key, name, json.dumps(tickers), now, now)
+            "INSERT INTO universes (key, name, tickers, is_index) "
+            "VALUES (%s, %s, %s, 0) ON CONFLICT (key) DO UPDATE "
+            "SET name=EXCLUDED.name, tickers=EXCLUDED.tickers RETURNING id",
+            (key, name, json.dumps(tickers))
         )
         new_id = cur.fetchone()[0]
         conn.commit()
@@ -184,8 +159,8 @@ def update_custom_universe(universe_id: int, name: str, tickers: list):
         conn = _conn()
         cur = conn.cursor()
         cur.execute(
-            "UPDATE inst_custom_universes SET name=%s, tickers=%s, updated_at=%s WHERE id=%s",
-            (name, json.dumps(tickers), now, universe_id)
+            "UPDATE universes SET name=%s, tickers=%s WHERE id=%s AND is_index=0",
+            (name, json.dumps(tickers), universe_id)
         )
         conn.commit()
         cur.close()
@@ -202,7 +177,7 @@ def delete_custom_universe(universe_id: int):
     try:
         conn = _conn()
         cur = conn.cursor()
-        cur.execute("DELETE FROM inst_custom_universes WHERE id = %s", (universe_id,))
+        cur.execute("DELETE FROM universes WHERE id = %s AND is_index = 0", (universe_id,))
         conn.commit()
         cur.close()
         conn.close()
