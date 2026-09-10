@@ -190,7 +190,7 @@ def results():
             "days":       days,
         })
 
-    return jsonify({
+    resp = jsonify({
         "status":     "ok",
         "results":    data["results"],
         "count":      data["count"],
@@ -198,6 +198,8 @@ def results():
         "universe":   universe,
         "days":       days,
     })
+    resp.headers['Cache-Control'] = 'public, max-age=86400'
+    return resp
 
 
 @app.route("/api/scan", methods=["POST"])
