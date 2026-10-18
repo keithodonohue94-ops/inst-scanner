@@ -165,7 +165,7 @@ def refresh_cusips(tickers: list[str], max_age_days: int = 90) -> int:
 
 
 # ── 13F parsing ───────────────────────────────────────────────────────────────
-_TAG = lambda name: re.compile(rf"<(?:\w+:)?{name}>\s*(.*?)\s*</(?:\w+:)?{name}>", re.I | re.S)
+_TAG = lambda name: re.compile(rf"<(?:\w+:)?{name}(?:\s[^>]*)?>\s*(.*?)\s*</(?:\w+:)?{name}>", re.I | re.S)
 _RE_BLOCK, _RE_CUSIP, _RE_ISSUER = _TAG("infoTable"), _TAG("cusip"), _TAG("nameOfIssuer")
 _RE_TITLE, _RE_VALUE, _RE_SHARES = _TAG("titleOfClass"), _TAG("value"), _TAG("sshPrnamt")
 _RE_SHTYPE, _RE_PUTCALL = _TAG("sshPrnamtType"), _TAG("putCall")
@@ -210,6 +210,47 @@ def _tier(filer: str, n_positions: int, top10_pct: float | None) -> str:
     return "diversified"
 
 
+def fetch_info_table(cik: int, accession: str, sec_get) -> tuple[str | None, str]:
+    """Raw 13F information-table XML for a filing, plus a reason when it can't be found.
+    The filing index lists both SEC's rendered web view (under an xslForm13F… folder) and
+    the raw XML; only the raw file contains <infoTable> elements."""
+    acc_nodash = accession.replace("-", "")
+    idx = sec_get(f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/{accession}-index.htm",
+                  extra_headers={"Accept": "text/html"}, timeout=15)
+    if not idx or not idx.ok:
+        return None, "index not found"
+    links = re.findall(r'href="(/Archives/edgar/data/[^"]+\.xml)"', idx.text, re.I)
+    raw = [l for l in links if "/xsl" not in l.lower()]
+    if not raw:
+        return None, "no raw xml in index"
+    # The information table is the raw XML that isn't the cover page (primary_doc.xml);
+    # prefer names that say so, otherwise take the largest-looking candidate list order.
+    cands = [l for l in raw if not l.lower().endswith("primary_doc.xml")] or raw
+    cands.sort(key=lambda l: 0 if re.search(r"info|table|holding", l, re.I) else 1)
+    for link in cands:
+        r = sec_get("https://www.sec.gov" + link, extra_headers={"Accept": "application/xml,text/xml"}, timeout=90)
+        if r is not None and r.ok and re.search(r"<(?:\w+:)?infoTable[\s>]", r.text, re.I):
+            return r.text, ""
+    return None, "no infoTable in raw xml"
+
+
+def _all_13f(data: dict, sec_get) -> list[tuple]:
+    """(form, filed, accession, period) for 13F-HR filings, newest first — from the recent
+    list and, when that holds too few (heavy 13G filers), the older history pages."""
+    def rows(block):
+        return list(zip(block.get("form", []), block.get("filingDate", []),
+                        block.get("accessionNumber", []), block.get("reportDate", [])))
+    out = [r for r in rows((data.get("filings") or {}).get("recent") or {}) if r[0] == "13F-HR"]
+    if len(out) < QUARTERS_TO_KEEP + 1:
+        for f in ((data.get("filings") or {}).get("files") or [])[:3]:
+            r = sec_get(f"https://data.sec.gov/submissions/{f.get('name')}", timeout=20)
+            if r is not None and r.ok:
+                out += [x for x in rows(r.json()) if x[0] == "13F-HR"]
+            if len(out) >= QUARTERS_TO_KEEP + 1:
+                break
+    return sorted(out, key=lambda x: x[1], reverse=True)
+
+
 def ingest_filer(display_name: str, cik: int, sec_get, info_table_xml, submissions_base: str,
                  quarters: int = QUARTERS_TO_KEEP) -> dict:
     """Store the latest `quarters` 13F-HR portfolios for one manager (skips ones already stored)."""
@@ -222,10 +263,10 @@ def ingest_filer(display_name: str, cik: int, sec_get, info_table_xml, submissio
     filer = data.get("name") or display_name
     recent = (data.get("filings") or {}).get("recent") or {}
     picked: dict[str, dict] = {}                       # period_end → newest original 13F-HR
-    for form, date, acc, period in zip(recent.get("form", []), recent.get("filingDate", []),
-                                       recent.get("accessionNumber", []), recent.get("reportDate", [])):
-        if form != "13F-HR" or not period:
-            continue                                    # amendments skipped: often partial
+    stats["skipped"] = []
+    for form, date, acc, period in _all_13f(data, sec_get):
+        if not period:
+            continue                                    # amendments (13F-HR/A) excluded: often partial
         if period not in picked:
             picked[period] = {"accession": acc, "filed_date": date, "period_end": period}
         if len(picked) >= quarters:
@@ -235,11 +276,13 @@ def ingest_filer(display_name: str, cik: int, sec_get, info_table_xml, submissio
     for f in picked.values():
         if f["accession"] in stored:
             continue
-        xml = info_table_xml(cik, f["accession"])
+        xml, why = fetch_info_table(cik, f["accession"], sec_get)
         if not xml:
+            stats["skipped"].append(f'{f["period_end"]} {f["accession"]}: {why}')
             continue
         pos = parse_info_table(xml)
         if not pos:
+            stats["skipped"].append(f'{f["period_end"]} {f["accession"]}: no equity positions parsed')
             continue
         total = sum(p["value"] for p in pos)
         top10 = sum(sorted((p["value"] for p in pos), reverse=True)[:10])
