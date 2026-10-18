@@ -24,7 +24,9 @@ from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from scanner import scan_tickers, backfill_prior_holdings, UNIVERSES as _BASE_UNIVERSES
+import scanner
 import db
+import holdings
 
 # Mutable universe registry — starts from scanner.py defaults, then
 # custom universes loaded from DB (and synced from the frontend) are merged in.
@@ -518,6 +520,90 @@ def trigger_backfill_prior():
     })
 
 
+# ── Full-portfolio 13F store (holdings.py) ───────────────────────────────────
+_INGEST_STATE: dict = {"running": False}
+_INGEST_LOCK_KEY = 813_013          # Postgres advisory lock id — one ingest across workers
+
+
+def _run_ingest():
+    """Refresh ticker→CUSIP for every universe ticker, then store each tracked manager's
+    latest 13F portfolios. Already-stored filings are skipped, so daily runs are cheap."""
+    st = _INGEST_STATE
+    if st.get("running"):
+        return
+    lock_conn = None
+    if holdings._USE_PG:
+        import psycopg2
+        lock_conn = psycopg2.connect(db.DATABASE_URL)
+        cur = lock_conn.cursor()
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (_INGEST_LOCK_KEY,))
+        if not cur.fetchone()[0]:
+            logger.info("13F ingest already running in another worker — skipping")
+            lock_conn.close()
+            return
+    st.clear()
+    st.update(running=True, started_at=_now(), managers=[])
+    try:
+        holdings.init_tables()
+        unis = holdings.universe_tickers(UNIVERSES)
+        tracked = sorted({t for v in unis.values() for t in v})
+        st["tracked_tickers"] = len(tracked)
+        st["cusips_fetched"] = holdings.refresh_cusips(tracked)
+        for display_name, cik in scanner.TOP_INSTITUTIONS:
+            try:
+                r = holdings.ingest_filer(display_name, cik, scanner._sec_get,
+                                          scanner._get_info_table_xml, scanner.SUBMISSIONS_BASE)
+            except Exception as e:
+                logger.exception("ingest %s", display_name)
+                r = {"filer": display_name, "error": str(e)}
+            st["managers"].append(r)
+            scanner._xml_cache.clear()          # big XMLs — don't keep them in memory
+        st["finished_at"] = _now()
+    except Exception as e:
+        logger.exception("13F ingest failed")
+        st["error"] = str(e)
+    finally:
+        st["running"] = False
+        if lock_conn is not None:
+            lock_conn.close()                   # releases the advisory lock
+
+
+@app.route("/api/ingest", methods=["POST"])
+def ingest_start():
+    if _INGEST_STATE.get("running"):
+        return jsonify({"status": "already running"})
+    threading.Thread(target=_run_ingest, daemon=True).start()
+    return jsonify({"status": "started"})
+
+
+@app.route("/api/ingest", methods=["GET"])
+def ingest_status():
+    try:
+        store = holdings.store_status()
+    except Exception as e:
+        store = {"error": str(e)}
+    return jsonify({**_INGEST_STATE, "store": store})
+
+
+@app.route("/api/holdings")
+def holdings_api():
+    """Latest-quarter 13F holdings of tracked managers for the universe's tickers, each with
+    its change vs that manager's prior quarter, portfolio weight and manager tier."""
+    universe = request.args.get("universe", "all") or "all"
+    try:
+        unis = holdings.universe_tickers(UNIVERSES)
+        tickers = set(unis.get(universe, [])) if universe != "all" else {t for v in unis.values() for t in v}
+        rows = holdings.holdings_view(tickers)
+        store = holdings.store_status()
+    except Exception as e:
+        logger.exception("holdings api")
+        return jsonify({"status": "error", "error": str(e), "results": [], "count": 0})
+    resp = jsonify({"status": "ok" if rows else "no_data", "universe": universe, "count": len(rows),
+                    "results": rows, "scanned_at": store.get("latest_filed"), "store": store})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _now():
@@ -537,26 +623,21 @@ def _startup():
     if custom:
         logger.info("Loaded %d custom universes from DB. Total UNIVERSES: %d", len(custom), len(UNIVERSES))
 
-    # 3. Check if DB has any data; if not, kick off initial backfill
-    cached = db.load_all_cached()
-    if not cached:
-        logger.info("No cached data in DB — triggering initial backfill")
-        t = threading.Thread(target=_run_backfill, daemon=True)
-        t.start()
-    else:
-        logger.info("DB has %d cached scans — results served directly from DB on request", len(cached))
+    # 3. Full-portfolio 13F store: create tables; first run fills it in the background
+    try:
+        holdings.init_tables()
+        if not holdings.store_status().get("filings"):
+            logger.info("13F store empty — starting initial ingest")
+            threading.Thread(target=_run_ingest, daemon=True).start()
+    except Exception as e:
+        logger.warning("13F store init: %s", e)
 
-    # 3. Daily scheduler at 12:00 UTC = 7:00 AM EST
+    # 4. Daily 13F ingest at 12:00 UTC (7/8am ET). Only new filings are downloaded; an
+    #    advisory lock stops the second gunicorn worker running it twice.
     scheduler = BackgroundScheduler()
-    scheduler.add_job(
-        _daily_fetch,
-        "cron",
-        hour=12, minute=0,
-        id="daily_inst_fetch",
-        replace_existing=True,
-    )
+    scheduler.add_job(_run_ingest, "cron", hour=12, minute=0, id="daily_13f_ingest", replace_existing=True)
     scheduler.start()
-    logger.info("Scheduler started — daily institutional fetch at 12:00 UTC (7:00 AM EST)")
+    logger.info("Scheduler started — daily 13F ingest at 12:00 UTC")
 
 
 # Run startup logic once (gunicorn spawns multiple workers; only master needs this)
