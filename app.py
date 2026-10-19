@@ -593,12 +593,17 @@ def holdings_api():
     try:
         unis = holdings.universe_tickers(UNIVERSES)
         tickers = set(unis.get(universe, [])) if universe != "all" else {t for v in unis.values() for t in v}
-        rows = holdings.holdings_view(tickers)
+        periods = holdings.available_periods()
+        period = request.args.get("period") or holdings.default_period(periods)
+        if period == "latest":
+            period = None                               # each manager's own latest quarter
+        rows = holdings.holdings_view(tickers, period)
         store = holdings.store_status()
     except Exception as e:
         logger.exception("holdings api")
         return jsonify({"status": "error", "error": str(e), "results": [], "count": 0})
     resp = jsonify({"status": "ok" if rows else "no_data", "universe": universe, "count": len(rows),
+                    "period": period or "latest", "periods": periods,
                     "results": rows, "scanned_at": store.get("latest_filed"), "store": store})
     resp.headers["Cache-Control"] = "no-store"
     return resp

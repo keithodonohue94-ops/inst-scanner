@@ -312,9 +312,28 @@ def ingest_filer(display_name: str, cik: int, sec_get, info_table_xml, submissio
 
 
 # ── query: latest quarter vs prior quarter, universe tickers only ─────────────
-def holdings_view(tickers: set[str]) -> list[dict]:
-    """One row per (manager, ticker) in the manager's latest stored quarter, with the change
-    against that manager's previous stored quarter. Exits included."""
+def available_periods() -> list[dict]:
+    """Stored quarters, newest first, with how many managers have filed each."""
+    with _DB() as d:
+        rows = d.q("""SELECT period, MAX(period_end), COUNT(DISTINCT cik) FROM inst_filings
+                       GROUP BY period ORDER BY MAX(period_end) DESC""").fetchall()
+        total = d.q("SELECT COUNT(DISTINCT cik) FROM inst_filings").fetchone()[0] or 0
+    return [{"period": r[0], "period_end": r[1], "managers": r[2], "total_managers": total} for r in rows]
+
+
+def default_period(periods: list[dict]) -> str | None:
+    """Newest quarter that at least half the tracked managers have filed (13Fs land up to
+    45 days after quarter end, so the newest quarter is often only partly in)."""
+    for p in periods:
+        if p["total_managers"] and p["managers"] * 2 >= p["total_managers"]:
+            return p["period"]
+    return periods[0]["period"] if periods else None
+
+
+def holdings_view(tickers: set[str], period: str | None = None) -> list[dict]:
+    """One row per (manager, ticker) in the manager's filing for `period` (or its latest stored
+    quarter when no period is given), with the change against that manager's previous stored
+    quarter. Exits included. Managers with no filing for `period` are left out."""
     with _DB() as d:
         tmap = {c8: t for t, c8 in d.q("SELECT ticker, cusip8 FROM ticker_cusip WHERE cusip8 IS NOT NULL").fetchall()
                 if t in tickers}
@@ -335,6 +354,11 @@ def holdings_view(tickers: set[str]) -> list[dict]:
         h["value"] += val or 0
     out = []
     for cik, fl in by_cik.items():
+        if period:
+            idx = next((i for i, f in enumerate(fl) if f[4] == period), None)
+            if idx is None:
+                continue                                # this manager hasn't filed that quarter
+            fl = fl[idx:]
         cur, prev = fl[0], (fl[1] if len(fl) > 1 else None)
         cur_tickers = {t for (a, t) in holding if a == cur[0]}
         prev_tickers = {t for (a, t) in holding if prev and a == prev[0]}
