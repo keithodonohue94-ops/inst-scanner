@@ -51,6 +51,11 @@ if DATABASE_URL:
 # Index / passive managers: their buying mostly reflects fund flows, not views.
 _PASSIVE_NAMES = re.compile(r"vanguard|blackrock|state street|geode|northern trust|"
                             r"charles schwab|schwab charles|invesco|dimensional", re.I)
+# Systematic / multi-strategy books: thousands of model-driven, short-horizon positions —
+# active, but a single position rarely reflects a fundamental view.
+_QUANT_NAMES = re.compile(r"renaissance|two sigma|d\.?\s?e\.? shaw|aqr|citadel|millennium|"
+                          r"jane street|susquehanna|hudson river|virtu|point72|balyasny|"
+                          r"qube|cubist|man group|winton|de shaw", re.I)
 
 QUARTERS_TO_KEEP = 3          # latest + two prior quarters per manager
 
@@ -203,9 +208,14 @@ def parse_info_table(xml: str) -> list[dict]:
 
 
 def _tier(filer: str, n_positions: int, top10_pct: float | None) -> str:
-    if _PASSIVE_NAMES.search(filer or "") or n_positions >= 2000:
+    """passive = index houses (flows into index funds/ETFs); quant = systematic/multi-strat;
+    concentrated = high-conviction book; diversified = everything else (incl. large active
+    houses like T. Rowe, Capital, Wellington that hold thousands of names across many funds)."""
+    if _PASSIVE_NAMES.search(filer or ""):
         return "passive"
-    if (top10_pct or 0) >= 50 or n_positions <= 150:
+    if _QUANT_NAMES.search(filer or ""):
+        return "quant"
+    if (top10_pct or 0) >= 50 or (n_positions or 0) <= 150:
         return "concentrated"
     return "diversified"
 
@@ -392,7 +402,7 @@ def holdings_view(tickers: set[str], period: str | None = None) -> list[dict]:
                 "weight_pct": w, "prev_weight_pct": pw,
                 "weight_delta": round(w - pw, 3) if (w is not None and pw is not None) else None,
                 "filer_total_value": cur[6], "filer_positions": cur[7], "filer_top10_pct": cur[8],
-                "filer_tier": cur[9],
+                "filer_tier": _tier(cur[2], cur[7] or 0, cur[8]),
             })
     return out
 
