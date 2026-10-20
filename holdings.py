@@ -345,8 +345,10 @@ def holdings_view(tickers: set[str], period: str | None = None) -> list[dict]:
     quarter when no period is given), with the change against that manager's previous stored
     quarter. Exits included. Managers with no filing for `period` are left out."""
     with _DB() as d:
-        tmap = {c8: t for t, c8 in d.q("SELECT ticker, cusip8 FROM ticker_cusip WHERE cusip8 IS NOT NULL").fetchall()
-                if t in tickers}
+        tc = [r for r in d.q("SELECT ticker, cusip8, name FROM ticker_cusip WHERE cusip8 IS NOT NULL").fetchall()
+              if r[0] in tickers]
+        tmap = {c8: t for t, c8, _ in tc}
+        names = {t: (n or "") for t, _, n in tc}
         filings = d.q("""SELECT accession, cik, filer, period_end, period, filed_date, total_value,
                                 n_positions, top10_pct, tier FROM inst_filings ORDER BY cik, period_end DESC""").fetchall()
         by_cik: dict[int, list] = {}
@@ -392,7 +394,7 @@ def holdings_view(tickers: set[str], period: str | None = None) -> list[dict]:
             w = round(val / cur[6] * 100, 3) if cur[6] else None
             pw = round(pval / prev[6] * 100, 3) if (prev and pval is not None and prev[6]) else None
             out.append({
-                "ticker": t, "filer": cur[2], "cik": cik, "form": "13F-HR",
+                "ticker": t, "company": names.get(t, ""), "filer": cur[2], "cik": cik, "form": "13F-HR",
                 "period": cur[4], "period_end": cur[3], "filed_date": cur[5], "accession": cur[0],
                 "shares": sh, "value": val, "value_k": val,          # value_k kept for the existing UI (dollars)
                 "prev_period": prev[4] if prev else None,
