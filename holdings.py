@@ -49,8 +49,20 @@ if DATABASE_URL:
         pass
 
 # Index / passive managers: their buying mostly reflects fund flows, not views.
-_PASSIVE_NAMES = re.compile(r"vanguard|blackrock|state street|geode|northern trust|"
-                            r"charles schwab|schwab charles|invesco|dimensional", re.I)
+_PASSIVE_NAMES = re.compile(r"vanguard|blackrock|state street|ssga|geode|northern trust|"
+                            r"charles schwab|schwab charles|invesco|dimensional|"
+                            r"legal\s*&\s*general|parametric|nuveen|teachers insurance|tiaa|"
+                            r"bny mellon|bank of new york|mellon|amundi|norges bank|"
+                            r"principal financial|ameriprise|lpl financial", re.I)
+# Banks, broker-dealers and wealth platforms: 13Fs aggregate client accounts, market-making and
+# hedges, so a position change rarely reflects an investment view. Excluded from "active".
+_BANK_NAMES = re.compile(r"goldman sachs|morgan stanley|jp\s?morgan|j\.\s?p\.\s?morgan|bank of america|"
+                         r"merrill lynch|citigroup|wells fargo|ubs group|ubs ag|ubs securities|barclays|"
+                         r"deutsche bank|royal bank of canada|rbc capital|bnp paribas|hsbc|credit suisse|"
+                         r"nomura|mizuho|mufg|mitsubishi ufj|sumitomo mitsui|raymond james|stifel|"
+                         r"jefferies|td securities|toronto[- ]dominion|bank of montreal|bmo|scotia|"
+                         r"cibc|societe generale|natixis|banco santander|interactive brokers|"
+                         r"oppenheimer & co|piper sandler|cowen|commonwealth equity|osaic|cetera|edward jones", re.I)
 # Systematic / multi-strategy books: thousands of model-driven, short-horizon positions —
 # active, but a single position rarely reflects a fundamental view.
 _QUANT_NAMES = re.compile(r"renaissance|two sigma|d\.?\s?e\.? shaw|aqr|citadel|millennium|"
@@ -208,11 +220,14 @@ def parse_info_table(xml: str) -> list[dict]:
 
 
 def _tier(filer: str, n_positions: int, top10_pct: float | None) -> str:
-    """passive = index houses (flows into index funds/ETFs); quant = systematic/multi-strat;
+    """passive = index houses (flows into index funds/ETFs); bank = banks/brokers/wealth platforms
+    (client + market-making books); quant = systematic/multi-strat;
     concentrated = high-conviction book; diversified = everything else (incl. large active
     houses like T. Rowe, Capital, Wellington that hold thousands of names across many funds)."""
     if _PASSIVE_NAMES.search(filer or ""):
         return "passive"
+    if _BANK_NAMES.search(filer or ""):
+        return "bank"
     if _QUANT_NAMES.search(filer or ""):
         return "quant"
     if (top10_pct or 0) >= 50 or (n_positions or 0) <= 150:
