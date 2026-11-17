@@ -234,11 +234,12 @@ _NOT_COMMON = re.compile(r"PFD|PREF|DEP\s*SH|DEPOSITARY|NOTE|DEB|BOND|WARR|WT\b|
 
 
 def _norm_issuer(s: str) -> str:
-    """'EXXON MOBIL CORP', 'Exxon Mobil Corporation' and 'EXXON MOBIL CORP /TX/' → 'EXXON MOBIL'."""
+    """'EXXON MOBIL CORP', 'EXXONMOBIL HOLDINGS CORP' and 'Exxon Mobil Corporation /TX/' → 'EXXONMOBIL'."""
     s = re.sub(r"[^A-Z0-9 ]", " ", (s or "").upper())
     s = re.sub(r"\b(INC|CORP|CORPORATION|CO|COMPANY|LTD|PLC|NEW|HLDGS|HOLDINGS|THE|COM|CL A|CLASS A|N V|NV)\b", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-    return _STATE_SUFFIX.sub("", s).strip()
+    # spaces dropped last: "EXXON MOBIL CORP" and "EXXONMOBIL HOLDINGS CORP" (its 2026 holding-company CUSIP) match
+    return _STATE_SUFFIX.sub("", s).strip().replace(" ", "")
 
 
 def cusip_aliases(mapped: dict, occurrences: dict, issuer_of: dict, period_of_acc: dict,
