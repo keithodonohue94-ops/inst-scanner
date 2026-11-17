@@ -549,6 +549,10 @@ def _run_ingest():
         tracked = sorted({t for v in unis.values() for t in v})
         st["tracked_tickers"] = len(tracked)
         st["cusips_fetched"] = holdings.refresh_cusips(tracked)
+        try:
+            st["splits_checked"] = holdings.refresh_splits(tracked)
+        except Exception as e:
+            logger.warning("split refresh: %s", e)
         for display_name, cik in scanner.TOP_INSTITUTIONS:
             try:
                 r = holdings.ingest_filer(display_name, cik, scanner._sec_get,
@@ -637,12 +641,14 @@ def _startup():
     except Exception as e:
         logger.warning("13F store init: %s", e)
 
-    # 4. Daily 13F ingest at 12:00 UTC (7/8am ET). Only new filings are downloaded; an
-    #    advisory lock stops the second gunicorn worker running it twice.
-    scheduler = BackgroundScheduler()
-    scheduler.add_job(_run_ingest, "cron", hour=12, minute=0, id="daily_13f_ingest", replace_existing=True)
+    # 4. 13F ingest twice a day: 10:00 UTC (5-6am ET, before the Radar pre-market rebuild and the
+    #    6:15 ET Morning Brief) and 23:00 UTC (6-7pm ET, so filings made on a deadline day — most
+    #    managers file late in the afternoon — are in that evening). Only new filings are downloaded;
+    #    an advisory lock stops the second gunicorn worker running it twice.
+    scheduler = BackgroundScheduler(timezone="UTC")
+    scheduler.add_job(_run_ingest, "cron", hour="10,23", minute=0, id="daily_13f_ingest", replace_existing=True)
     scheduler.start()
-    logger.info("Scheduler started — daily 13F ingest at 12:00 UTC")
+    logger.info("Scheduler started — 13F ingest at 10:00 and 23:00 UTC")
 
 
 # Run startup logic once (gunicorn spawns multiple workers; only master needs this)
