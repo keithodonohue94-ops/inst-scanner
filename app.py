@@ -613,6 +613,19 @@ def holdings_api():
     return resp
 
 
+@app.route("/api/holdings/aliases")
+def holdings_aliases():
+    """Diagnostics for CUSIP changes: ?issuer=EXXON lists every stored CUSIP for that issuer name; without it,
+    the CUSIP-link decisions from the last holdings request."""
+    iss = (request.args.get("issuer") or "").strip()
+    try:
+        if iss:
+            return jsonify({"issuer": iss, "cusips": holdings.issuer_cusips(iss)})
+        return jsonify({"last_decisions": holdings.ALIAS_DEBUG})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _now():

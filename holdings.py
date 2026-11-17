@@ -229,13 +229,20 @@ def split_factor(splits: list, after: str, upto: str) -> float:
     return f
 
 
+_STATE_SUFFIX = re.compile(r"\b(TX|DE|NJ|NY|NV|MD|PA|OH|VA|MA|CA|IL|MN|WI|IN|MO|GA|FL|NC|WA|OR|CO|AZ|UT)$")
+_NOT_COMMON = re.compile(r"PFD|PREF|DEP\s*SH|DEPOSITARY|NOTE|DEB|BOND|WARR|WT\b|RIGHT|\bRT\b|UNIT|CONV|SR\b|%", re.I)
+
+
 def _norm_issuer(s: str) -> str:
+    """'EXXON MOBIL CORP', 'Exxon Mobil Corporation' and 'EXXON MOBIL CORP /TX/' → 'EXXON MOBIL'."""
     s = re.sub(r"[^A-Z0-9 ]", " ", (s or "").upper())
-    s = re.sub(r"\b(INC|CORP|CORPORATION|CO|COMPANY|LTD|PLC|NEW|HLDGS|HOLDINGS|THE|COM|CL A|CLASS A)\b", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"\b(INC|CORP|CORPORATION|CO|COMPANY|LTD|PLC|NEW|HLDGS|HOLDINGS|THE|COM|CL A|CLASS A|N V|NV)\b", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return _STATE_SUFFIX.sub("", s).strip()
 
 
-def cusip_aliases(mapped: dict, occurrences: dict, issuer_of: dict, period_of_acc: dict) -> dict:
+def cusip_aliases(mapped: dict, occurrences: dict, issuer_of: dict, period_of_acc: dict,
+                  title_of: dict | None = None, debug: dict | None = None) -> dict:
     """Old CUSIP → ticker, for companies whose CUSIP changed (XOM, OKE: every holder "initiated" in Q3 because Q2
     was filed under the old CUSIP). A candidate CUSIP is linked only when (a) its issuer name matches exactly one
     mapped ticker's, (b) it never appears in the same filing as that ticker's current CUSIP — share classes and
@@ -247,6 +254,7 @@ def cusip_aliases(mapped: dict, occurrences: dict, issuer_of: dict, period_of_ac
         if n:
             by_name.setdefault(n, set()).add(c8)
     out = {}
+    title_of = title_of or {}
     for c8, accs in occurrences.items():
         if c8 in mapped:
             continue
@@ -255,11 +263,26 @@ def cusip_aliases(mapped: dict, occurrences: dict, issuer_of: dict, period_of_ac
             continue
         m = next(iter(cur))
         m_accs = occurrences.get(m, set())
-        if not m_accs or accs & m_accs:
-            continue
-        if max(period_of_acc.get(a, "") for a in accs) >= min(period_of_acc.get(a, "9") for a in m_accs):
-            continue
-        out[c8] = mapped[m]
+        why = None
+        if _NOT_COMMON.search(title_of.get(c8) or ""):
+            why = "not common stock: " + (title_of.get(c8) or "")
+        elif not m_accs:
+            why = "current CUSIP has no filings"
+        else:
+            both = len(accs & m_accs)
+            # a manager mid-transition can list both CUSIPs once; share classes / preferreds co-occur routinely
+            if both > max(1, 0.05 * len(accs | m_accs)):
+                why = f"appears with the current CUSIP in {both} filings"
+            else:
+                new_first = min(period_of_acc.get(a, "9") for a in m_accs)
+                later = sum(1 for a in accs if period_of_acc.get(a, "") >= new_first)
+                if later > 0.1 * len(accs):
+                    why = f"{later} of {len(accs)} filings are not older than the current CUSIP's first ({new_first})"
+        if debug is not None:
+            debug[c8] = {"issuer": issuer_of.get(c8), "title": title_of.get(c8), "ticker": mapped[m],
+                         "filings": len(accs), "linked": why is None, "why_not": why}
+        if why is None:
+            out[c8] = mapped[m]
     return out
 
 
@@ -279,8 +302,11 @@ def flag_corporate_actions(rows: list, min_holders: int = 5) -> dict:
         if 0.8 <= m <= 1.25:
             continue
         near = sum(1 for x in rs if abs(x / m - 1) <= 0.10)
-        if near >= 0.7 * len(rs):
-            out[t] = f"{near} of {len(rs)} holders' share counts changed by about x{m:.2f} with no split on record (merger or spin-off?)"
+        # Either most holders moved by the same ratio, or the median holder's count moved by 40%+ either way —
+        # large managers' positions don't move that much in aggregate from trading (EQR: median x2.09, but the
+        # holders also traded, so only 7 of 16 sat within 10% of it).
+        if near >= 0.7 * len(rs) or (len(rs) >= 8 and not 0.7 <= m <= 1.4):
+            out[t] = f"median holder's share count changed x{m:.2f} ({near} of {len(rs)} within 10%) with no split on record (merger or spin-off?)"
     return out
 
 
@@ -485,6 +511,20 @@ def value_scale(holding: dict, period_of: dict) -> dict:
     return out
 
 
+ALIAS_DEBUG: dict = {}          # last holdings_view's CUSIP-alias decisions (for /api/holdings/aliases)
+
+
+def issuer_cusips(pattern: str) -> list[dict]:
+    """Every stored CUSIP whose issuer name starts with `pattern` — to see why a CUSIP change was or wasn't linked."""
+    with _DB() as d:
+        rows = d.q("""SELECT cusip8, MAX(issuer), MAX(title), COUNT(*), MIN(period_end), MAX(period_end)
+                      FROM inst_positions WHERE UPPER(issuer) LIKE %s GROUP BY cusip8 ORDER BY 6 DESC""",
+                   (pattern.upper() + "%",)).fetchall()
+        mapped = {c8: t for t, c8 in d.q("SELECT ticker, cusip8 FROM ticker_cusip").fetchall()}
+    return [{"cusip8": r[0], "issuer": r[1], "title": r[2], "positions": r[3], "first": r[4], "last": r[5],
+             "ticker": mapped.get(r[0]), "norm": _norm_issuer(r[1])} for r in rows]
+
+
 def holdings_view(tickers: set[str], period: str | None = None) -> list[dict]:
     """One row per (manager, ticker) in the manager's filing for `period` (or its latest stored
     quarter when no period is given), with the change against that manager's previous stored
@@ -507,12 +547,12 @@ def holdings_view(tickers: set[str], period: str | None = None) -> list[dict]:
                                                      WHERE cusip8 IN ({marks}) GROUP BY cusip8""", tuple(tmap.keys())).fetchall()}
         # candidate old CUSIPs: same normalised issuer name, not mapped to any ticker
         iss_names = {_norm_issuer(n) for n in issuer_of.values() if n}
-        cand = {}
+        cand, cand_title = {}, {}
         if iss_names:
-            for c8, iss in d.q("""SELECT cusip8, MAX(issuer) FROM inst_positions WHERE cusip8 IS NOT NULL
-                                  GROUP BY cusip8""").fetchall():
+            for c8, iss, ttl in d.q("""SELECT cusip8, MAX(issuer), MAX(title) FROM inst_positions WHERE cusip8 IS NOT NULL
+                                       GROUP BY cusip8""").fetchall():
                 if c8 not in all_mapped and _norm_issuer(iss) in iss_names:
-                    cand[c8] = iss
+                    cand[c8], cand_title[c8] = iss, ttl
         keys = tuple(tmap.keys()) + tuple(cand.keys())
         marks = ",".join(["%s"] * len(keys))
         pos = d.q(f"""SELECT accession, cusip8, shares, value FROM inst_positions
@@ -526,7 +566,8 @@ def holdings_view(tickers: set[str], period: str | None = None) -> list[dict]:
         occ: dict[str, set] = {}
         for acc, c8, _sh, _v in pos:
             occ.setdefault(c8, set()).add(acc)
-        alias = cusip_aliases(tmap, occ, {**issuer_of, **cand}, {f[0]: f[3] for f in filings})
+        ALIAS_DEBUG.clear()
+        alias = cusip_aliases(tmap, occ, {**issuer_of, **cand}, {f[0]: f[3] for f in filings}, cand_title, ALIAS_DEBUG)
         if alias:
             logger.info("13F CUSIP aliases: %s", alias)
         tmap = {**tmap, **alias}
