@@ -506,12 +506,12 @@ def holdings_view(tickers: set[str], period: str | None = None) -> list[dict]:
         issuer_of = {c8: iss for c8, iss in d.q(f"""SELECT cusip8, MAX(issuer) FROM inst_positions
                                                      WHERE cusip8 IN ({marks}) GROUP BY cusip8""", tuple(tmap.keys())).fetchall()}
         # candidate old CUSIPs: same normalised issuer name, not mapped to any ticker
-        names = {_norm_issuer(n) for n in issuer_of.values() if n}
+        iss_names = {_norm_issuer(n) for n in issuer_of.values() if n}
         cand = {}
-        if names:
+        if iss_names:
             for c8, iss in d.q("""SELECT cusip8, MAX(issuer) FROM inst_positions WHERE cusip8 IS NOT NULL
                                   GROUP BY cusip8""").fetchall():
-                if c8 not in all_mapped and _norm_issuer(iss) in names:
+                if c8 not in all_mapped and _norm_issuer(iss) in iss_names:
                     cand[c8] = iss
         keys = tuple(tmap.keys()) + tuple(cand.keys())
         marks = ",".join(["%s"] * len(keys))
